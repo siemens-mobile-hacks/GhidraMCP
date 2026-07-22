@@ -22,6 +22,21 @@ MCP Server + Ghidra Plugin
 - List methods, classes, imports, and exports
 - Work with multiple binaries open in one Ghidra tool (target each by name)
 
+## Differences from upstream
+
+Compared with the [original GhidraMCP](https://github.com/LaurieWired/GhidraMCP),
+this fork adds:
+
+- Support for Ghidra 12.1.2 and a `build.sh` helper that collects the required
+  libraries from a local Ghidra installation before building the extension.
+- An optional `program` selector for every program-scoped MCP tool, allowing
+  several binaries open in one Ghidra instance to be queried and modified
+  without switching the focused Code Browser tab.
+- Program discovery through `list_open_programs` and `get_current_program`.
+- Data-management tools for clearing and defining data, reading bytes, querying
+  data items, creating labels, enums and structures, and applying structures.
+- Batch operations for defining data, renaming functions and setting comments.
+
 ## Multiple open programs
 
 When several programs are open in the same Ghidra tool, every tool that reads or
