@@ -376,7 +376,7 @@ def read_bytes(address: str, length: int, program: str = "") -> str:
     """
     Read raw bytes from memory at a given address. Returns hex-encoded string.
     """
-    return safe_get("read_bytes", _with_program({"address": address, "length": length}, program))
+    return "\n".join(safe_get("read_bytes", _with_program({"address": address, "length": length}, program)))
 
 @mcp.tool()
 def get_data_at(address: str, program: str = "") -> str:
@@ -384,7 +384,7 @@ def get_data_at(address: str, program: str = "") -> str:
     Get detailed info about the data item at a specific address:
     type, size, label, value, and containing item info.
     """
-    return safe_get("get_data_at", _with_program({"address": address}, program))
+    return "\n".join(safe_get("get_data_at", _with_program({"address": address}, program)))
 
 @mcp.tool()
 def batch_rename_functions(renames: list[dict], program: str = "") -> str:

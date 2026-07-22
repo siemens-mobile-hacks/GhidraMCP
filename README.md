@@ -33,8 +33,9 @@ this fork adds:
   several binaries open in one Ghidra instance to be queried and modified
   without switching the focused Code Browser tab.
 - Program discovery through `list_open_programs` and `get_current_program`.
-- Data-management tools for clearing and defining data, reading bytes, querying
-  data items, creating labels, enums and structures, and applying structures.
+- Data-management tools for clearing and defining data, reading bytes with
+  `read_bytes`, querying data items with `get_data_at`, creating labels, enums
+  and structures, and applying structures.
 - Batch operations for defining data, renaming functions and setting comments.
 
 ## Multiple open programs
