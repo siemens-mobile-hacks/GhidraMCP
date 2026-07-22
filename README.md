@@ -20,6 +20,18 @@ MCP Server + Ghidra Plugin
 - Decompile and analyze binaries in Ghidra
 - Automatically rename methods and data
 - List methods, classes, imports, and exports
+- Work with multiple binaries open in one Ghidra tool (target each by name)
+
+## Multiple open programs
+
+When several programs are open in the same Ghidra tool, every tool that reads or
+modifies a program accepts an optional `program` argument to select which one to
+act on. Discover the open programs with `list_open_programs` (the focused one is
+marked `(current)`), then pass a name or project path, e.g.
+`list_methods(program="firmware.sb")`. Leaving `program` empty keeps the previous
+behavior and uses the currently focused program, so existing usage is
+unaffected. GUI-context tools such as `get_current_address` intentionally report
+the focused Code Browser state and do not take a program selector.
 
 # Installation
 
