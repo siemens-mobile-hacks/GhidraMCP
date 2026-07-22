@@ -70,6 +70,26 @@ def _with_program(params: dict, program: str) -> dict:
 # name or project path (see list_open_programs) to target a specific binary,
 # so multiple loaded binaries can be analyzed without switching tabs.
 
+def safe_post_json(endpoint: str, json_data, params: dict = None) -> str:
+    """
+    Perform a POST request with a JSON body.
+    """
+    import json
+    try:
+        url = urljoin(ghidra_server_url, endpoint)
+        body = json.dumps(json_data) if not isinstance(json_data, str) else json_data
+        response = requests.post(url, data=body.encode("utf-8"),
+                                 headers={"Content-Type": "application/json"},
+                                 params=params,
+                                 timeout=30)
+        response.encoding = 'utf-8'
+        if response.ok:
+            return response.text.strip()
+        else:
+            return f"Error {response.status_code}: {response.text.strip()}"
+    except Exception as e:
+        return f"Request failed: {str(e)}"
+
 @mcp.tool()
 def list_open_programs() -> list:
     """
@@ -319,6 +339,113 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None, program
     if filter:
         params["filter"] = filter
     return safe_get("strings", _with_program(params, program))
+
+@mcp.tool()
+def clear_data(address: str, size: int = None, program: str = "") -> str:
+    """
+    Clear (undefine) data at an address, reverting bytes to undefined state.
+    If size is omitted, clears the single data item at that address.
+    """
+    data = {"address": address}
+    if size is not None:
+        data["size"] = str(size)
+    return safe_post("clear_data", _with_program(data, program))
+
+@mcp.tool()
+def define_data(address: str, data_type: str, label: str = None, program: str = "") -> str:
+    """
+    Create a data definition at an address. Supported types: byte, word, dword, qword,
+    float, double, pointer, char, or any type in the data type manager.
+    Optionally assign a label/symbol name.
+    """
+    data = {"address": address, "data_type": data_type}
+    if label:
+        data["label"] = label
+    return safe_post("define_data", _with_program(data, program))
+
+@mcp.tool()
+def define_data_batch(items: list[dict], program: str = "") -> str:
+    """
+    Create multiple data definitions in a single transaction.
+    Each item: {"address": "0x...", "data_type": "dword", "label": "optional_name"}
+    """
+    return safe_post_json("define_data_batch", items, _with_program({}, program))
+
+@mcp.tool()
+def read_bytes(address: str, length: int, program: str = "") -> str:
+    """
+    Read raw bytes from memory at a given address. Returns hex-encoded string.
+    """
+    return safe_get("read_bytes", _with_program({"address": address, "length": length}, program))
+
+@mcp.tool()
+def get_data_at(address: str, program: str = "") -> str:
+    """
+    Get detailed info about the data item at a specific address:
+    type, size, label, value, and containing item info.
+    """
+    return safe_get("get_data_at", _with_program({"address": address}, program))
+
+@mcp.tool()
+def batch_rename_functions(renames: list[dict], program: str = "") -> str:
+    """
+    Rename multiple functions in one transaction.
+    Each item: {"address": "0x...", "new_name": "MyFunction"}
+    """
+    return safe_post_json("batch_rename_functions", renames, _with_program({}, program))
+
+@mcp.tool()
+def batch_set_comments(comments: list[dict], comment_type: str = "decompiler", program: str = "") -> str:
+    """
+    Set multiple comments in one transaction.
+    comment_type: "decompiler" (PRE_COMMENT) or "disassembly" (EOL_COMMENT).
+    Each comment: {"address": "0x...", "comment": "text"}
+    """
+    return safe_post_json("batch_set_comments", {
+        "comment_type": comment_type,
+        "comments": comments
+    }, _with_program({}, program))
+
+@mcp.tool()
+def create_label(address: str, name: str, namespace: str = None, program: str = "") -> str:
+    """
+    Create a label/symbol at any address (code, data, or undefined bytes).
+    """
+    data = {"address": address, "name": name}
+    if namespace:
+        data["namespace"] = namespace
+    return safe_post("create_label", _with_program(data, program))
+
+@mcp.tool()
+def create_enum(name: str, values: list[dict], size: int = 4, program: str = "") -> str:
+    """
+    Create an enum data type. Each value: {"name": "MEMBER_NAME", "value": 0}
+    """
+    return safe_post_json("create_enum", {
+        "name": name,
+        "size": size,
+        "values": values
+    }, _with_program({}, program))
+
+@mcp.tool()
+def create_struct(name: str, fields: list[dict], program: str = "") -> str:
+    """
+    Create a structure data type.
+    Each field: {"name": "field_name", "type": "int", "size": 4}
+    If size is omitted, the type's natural size is used.
+    """
+    return safe_post_json("create_struct", {
+        "name": name,
+        "fields": fields
+    }, _with_program({}, program))
+
+@mcp.tool()
+def apply_struct(address: str, struct_name: str, program: str = "") -> str:
+    """
+    Apply a previously created struct type at a memory address.
+    Clears existing data at the address range and stamps the struct.
+    """
+    return safe_post("apply_struct", _with_program({"address": address, "struct_name": struct_name}, program))
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
