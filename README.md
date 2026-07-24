@@ -33,10 +33,32 @@ this fork adds:
   several binaries open in one Ghidra instance to be queried and modified
   without switching the focused Code Browser tab.
 - Program discovery through `list_open_programs` and `get_current_program`.
-- Data-management tools for clearing and defining data, reading bytes with
-  `read_bytes`, querying data items with `get_data_at`, creating labels, enums
-  and structures, and applying structures.
-- Batch operations for defining data, renaming functions and setting comments.
+- Native function creation through `create_function`. A label such as `LAB_*`
+  is not treated as a function automatically: an instruction must exist at the
+  requested entry point, and creation is rejected inside another function.
+  This matches Ghidra's distinction between symbols and `Function` objects,
+  which are the objects accepted by the decompiler.
+- ARM/Thumb-aware `disassemble_code` with `auto`, `arm`, and `thumb` modes.
+  Existing instructions are preserved, and defined data must be cleared
+  explicitly before it can be converted to code.
+- Data-type tools backed by Ghidra's native `DataTypeParser` and `CParser`:
+  inspect, create, and apply structures (including self-references and explicit
+  field offsets), unions, enums, typedefs, pointers, arrays, bit fields, and C
+  declarations. Types use native Ghidra category paths and can subsequently be
+  used in data definitions, structure fields, and function prototypes.
+- Function-prototype updates through Ghidra's `FunctionSignatureParser`, with
+  optional `calling_convention` and `source_type` controls. Calls made by older
+  clients without a calling convention preserve the function's current ABI.
+- Data-management tools for safely clearing and defining data, reading bytes,
+  querying data items, and creating labels. Instructions are never cleared
+  implicitly, offcut data is handled by its complete range, and mutations are
+  verified before their transactions are committed.
+- Atomic batch operations for defining data, renaming functions, and setting
+  comments: a failed item rolls back the whole batch instead of leaving a
+  partially updated program.
+- Configurable HTTP bind host and port under `GhidraMCP HTTP Server` tool
+  options. The default is `127.0.0.1:8080`, so the plugin is not exposed on
+  external interfaces unless explicitly configured.
 
 ## Multiple open programs
 
@@ -65,7 +87,9 @@ First, download the latest [release](https://github.com/LaurieWired/GhidraMCP/re
 4. Select the `GhidraMCP-1-2.zip` (or your chosen version) from the downloaded release
 5. Restart Ghidra
 6. Make sure the GhidraMCPPlugin is enabled in `File` -> `Configure` -> `Developer`
-7. *Optional*: Configure the port in Ghidra with `Edit` -> `Tool Options` -> `GhidraMCP HTTP Server`
+7. *Optional*: Configure `Server Host` and `Server Port` in Ghidra with
+   `Edit` -> `Tool Options` -> `GhidraMCP HTTP Server`. The default host is
+   `127.0.0.1`; reload the plugin after changing either setting.
 
 Video Installation Guide:
 
@@ -127,18 +151,11 @@ Another MCP client that supports multiple models on the backend is [5ire](https:
 3. Command: `python /ABSOLUTE_PATH_TO/bridge_mcp_ghidra.py`
 
 # Building from Source
-1. Copy the following files from your Ghidra directory to this project's `lib/` directory:
-- `Ghidra/Features/Base/lib/Base.jar`
-- `Ghidra/Features/Decompiler/lib/Decompiler.jar`
-- `Ghidra/Framework/Docking/lib/Docking.jar`
-- `Ghidra/Framework/Generic/lib/Generic.jar`
-- `Ghidra/Framework/Project/lib/Project.jar`
-- `Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling.jar`
-- `Ghidra/Framework/Utility/lib/Utility.jar`
-- `Ghidra/Framework/Gui/lib/Gui.jar`
-2. Build with Maven by running:
 
-`mvn clean package assembly:single`
+Run `./build.sh`. It reads the installed Ghidra version from
+`/opt/ghidra` (override with `GHIDRA_HOME`), copies the matching development
+libraries into `lib/`, runs the parser tests, and creates
+`target/GhidraMCP-1.0-SNAPSHOT.zip`.
 
 The generated zip file includes the built Ghidra plugin and its resources. These files are required for Ghidra to recognize the new extension.
 

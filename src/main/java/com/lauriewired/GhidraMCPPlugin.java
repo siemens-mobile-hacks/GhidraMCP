@@ -22,6 +22,9 @@ import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.services.CodeViewerService;
 import ghidra.app.services.ProgramManager;
 import ghidra.app.util.PseudoDisassembler;
+import ghidra.app.cmd.disassemble.ArmDisassembleCommand;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.cmd.function.SetVariableNameCmd;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.listing.LocalVariableImpl;
@@ -32,6 +35,7 @@ import ghidra.framework.plugintool.PluginInfo;
 import ghidra.framework.plugintool.util.PluginStatus;
 import ghidra.program.util.ProgramLocation;
 import ghidra.util.Msg;
+import ghidra.util.data.DataTypeParser;
 import ghidra.util.task.ConsoleTaskMonitor;
 import ghidra.util.task.TaskMonitor;
 import ghidra.program.model.pcode.HighVariable;
@@ -43,6 +47,11 @@ import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.Undefined1DataType;
 import ghidra.program.model.data.EnumDataType;
 import ghidra.program.model.data.StructureDataType;
+import ghidra.program.model.data.UnionDataType;
+import ghidra.program.model.data.TypedefDataType;
+import ghidra.program.model.data.Composite;
+import ghidra.program.model.data.DataTypeComponent;
+import ghidra.program.model.data.TypeDef;
 import ghidra.program.model.data.CategoryPath;
 
 import com.google.gson.JsonArray;
@@ -52,6 +61,7 @@ import com.google.gson.JsonParser;
 import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
+import ghidra.app.util.cparser.C.CParser;
 import ghidra.framework.options.Options;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -79,7 +89,9 @@ public class GhidraMCPPlugin extends Plugin {
 
     private HttpServer server;
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
+    private static final String HOST_OPTION_NAME = "Server Host";
     private static final String PORT_OPTION_NAME = "Server Port";
+    private static final String DEFAULT_HOST = "127.0.0.1";
     private static final int DEFAULT_PORT = 8080;
 
     public GhidraMCPPlugin(PluginTool tool) {
@@ -88,6 +100,10 @@ public class GhidraMCPPlugin extends Plugin {
 
         // Register the configuration option
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
+        options.registerOption(HOST_OPTION_NAME, DEFAULT_HOST,
+            null,
+            "The network interface address for the embedded HTTP server. " +
+            "Use 127.0.0.1 for local-only access. Requires plugin reload to take effect.");
         options.registerOption(PORT_OPTION_NAME, DEFAULT_PORT,
             null, // No help location for now
             "The network port number the embedded HTTP server will listen on. " +
@@ -105,6 +121,8 @@ public class GhidraMCPPlugin extends Plugin {
     private void startServer() throws IOException {
         // Read the configured port
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
+        String configuredHost = options.getString(HOST_OPTION_NAME, DEFAULT_HOST).trim();
+        final String host = configuredHost.isEmpty() ? DEFAULT_HOST : configuredHost;
         int port = options.getInt(PORT_OPTION_NAME, DEFAULT_PORT);
 
         // Stop existing server if running (e.g., if plugin is reloaded)
@@ -114,7 +132,7 @@ public class GhidraMCPPlugin extends Plugin {
             server = null;
         }
 
-        server = HttpServer.create(new InetSocketAddress(port), 0);
+        server = HttpServer.create(new InetSocketAddress(host, port), 0);
 
         // Each listing endpoint uses offset & limit from query params:
         server.createContext("/methods", exchange -> {
@@ -146,8 +164,8 @@ public class GhidraMCPPlugin extends Plugin {
 
         server.createContext("/renameData", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
-            renameDataAtAddress(params.get("program"), params.get("address"), params.get("newName"));
-            sendResponse(exchange, "Rename data attempted");
+            sendResponse(exchange, renameDataAtAddress(
+                params.get("program"), params.get("address"), params.get("newName")));
         });
 
         server.createContext("/renameVariable", exchange -> {
@@ -231,7 +249,9 @@ public class GhidraMCPPlugin extends Plugin {
 
         server.createContext("/list_functions", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
-            sendResponse(exchange, listFunctions(qparams.get("program")));
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 1000);
+            sendResponse(exchange, listFunctions(qparams.get("program"), offset, limit));
         });
 
         server.createContext("/decompile_function", exchange -> {
@@ -244,6 +264,12 @@ public class GhidraMCPPlugin extends Plugin {
             Map<String, String> qparams = parseQueryParams(exchange);
             String address = qparams.get("address");
             sendResponse(exchange, disassembleFunction(qparams.get("program"), address));
+        });
+
+        server.createContext("/disassemble_code", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String result = disassembleCode(params.get("program"), params.get("address"), params.get("mode"));
+            sendResponse(exchange, result);
         });
 
         server.createContext("/set_decompiler_comment", exchange -> {
@@ -274,9 +300,12 @@ public class GhidraMCPPlugin extends Plugin {
             Map<String, String> params = parsePostParams(exchange);
             String functionAddress = params.get("function_address");
             String prototype = params.get("prototype");
+            String callingConvention = params.get("calling_convention");
+            String sourceType = params.get("source_type");
 
             // Call the set prototype function and get detailed result
-            PrototypeResult result = setFunctionPrototype(params.get("program"), functionAddress, prototype);
+            PrototypeResult result = setFunctionPrototype(params.get("program"), functionAddress,
+                prototype, callingConvention, sourceType);
 
             if (result.isSuccess()) {
                 // Even with successful operations, include any warning messages for debugging
@@ -307,19 +336,12 @@ public class GhidraMCPPlugin extends Plugin {
             Program program = getProgramByName(params.get("program"));
             if (program != null) {
                 DataTypeManager dtm = program.getDataTypeManager();
-                DataType directType = findDataTypeByNameInAllCategories(dtm, newType);
-                if (directType != null) {
-                    responseMsg.append("Found type: ").append(directType.getPathName()).append("\n");
-                } else if (newType.startsWith("P") && newType.length() > 1) {
-                    String baseTypeName = newType.substring(1);
-                    DataType baseType = findDataTypeByNameInAllCategories(dtm, baseTypeName);
-                    if (baseType != null) {
-                        responseMsg.append("Found base type for pointer: ").append(baseType.getPathName()).append("\n");
-                    } else {
-                        responseMsg.append("Base type not found for pointer: ").append(baseTypeName).append("\n");
-                    }
+                DataType resolvedType = resolveDataType(dtm, newType);
+                if (resolvedType != null) {
+                    responseMsg.append("Resolved type: ").append(resolvedType.getDisplayName())
+                        .append(" from ").append(resolvedType.getPathName()).append("\n");
                 } else {
-                    responseMsg.append("Type not found directly: ").append(newType).append("\n");
+                    responseMsg.append("Type could not be resolved: ").append(newType).append("\n");
                 }
             }
 
@@ -403,6 +425,19 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, result);
         });
 
+        server.createContext("/list_data_types", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, listDataTypes(qparams.get("program"), qparams.get("query"),
+                qparams.get("category"), offset, limit));
+        });
+
+        server.createContext("/get_data_type", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendResponse(exchange, getDataTypeDescription(qparams.get("program"), qparams.get("name")));
+        });
+
         server.createContext("/batch_rename_functions", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
             String body = readRequestBody(exchange);
@@ -426,6 +461,14 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, result);
         });
 
+        server.createContext("/create_function", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String name = params.get("name");
+            String result = createFunction(params.get("program"), address, name);
+            sendResponse(exchange, result);
+        });
+
         server.createContext("/create_enum", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
             String body = readRequestBody(exchange);
@@ -437,6 +480,32 @@ public class GhidraMCPPlugin extends Plugin {
             Map<String, String> qparams = parseQueryParams(exchange);
             String body = readRequestBody(exchange);
             String result = createStruct(qparams.get("program"), body);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/create_union", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String result = createUnion(qparams.get("program"), readRequestBody(exchange));
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/create_typedef", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String result = createTypedef(qparams.get("program"), readRequestBody(exchange));
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/parse_c_types", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String result = parseCTypes(qparams.get("program"), readRequestBody(exchange));
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/apply_data_type", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String result = applyDataType(params.get("program"), params.get("address"),
+                params.get("data_type"), parseBooleanOrDefault(params.get("clear_existing"), true),
+                params.get("label"));
             sendResponse(exchange, result);
         });
 
@@ -452,9 +521,10 @@ public class GhidraMCPPlugin extends Plugin {
         new Thread(() -> {
             try {
                 server.start();
-                Msg.info(this, "GhidraMCP HTTP server started on port " + port);
+                Msg.info(this, "GhidraMCP HTTP server started on " + host + ":" + port);
             } catch (Exception e) {
-                Msg.error(this, "Failed to start HTTP server on port " + port + ". Port might be in use.", e);
+                Msg.error(this, "Failed to start HTTP server on " + host + ":" + port +
+                    ". Address or port might be unavailable.", e);
                 server = null; // Ensure server isn't considered running
             }
         }, "GhidraMCP-HTTP-Server").start();
@@ -647,38 +717,55 @@ public class GhidraMCPPlugin extends Plugin {
         return successFlag.get();
     }
 
-    private void renameDataAtAddress(String programName, String addressStr, String newName) {
+    private String renameDataAtAddress(String programName, String addressStr, String newName) {
         Program program = getProgramByName(programName);
-        if (program == null) return;
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isBlank()) return "Address is required";
+        if (newName == null || newName.isBlank()) return "New name is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to rename data");
 
         try {
             SwingUtilities.invokeAndWait(() -> {
                 int tx = program.startTransaction("Rename data");
+                boolean success = false;
                 try {
                     Address addr = program.getAddressFactory().getAddress(addressStr);
+                    if (addr == null) throw new IllegalArgumentException("Invalid address: " + addressStr);
                     Listing listing = program.getListing();
                     Data data = listing.getDefinedDataAt(addr);
-                    if (data != null) {
-                        SymbolTable symTable = program.getSymbolTable();
-                        Symbol symbol = symTable.getPrimarySymbol(addr);
-                        if (symbol != null) {
-                            symbol.setName(newName, SourceType.USER_DEFINED);
-                        } else {
-                            symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
-                        }
+                    if (data == null) {
+                        result.set("No data defined at " + addr);
+                        return;
                     }
+                    SymbolTable symTable = program.getSymbolTable();
+                    Symbol symbol = symTable.getPrimarySymbol(addr);
+                    if (symbol != null) {
+                        symbol.setName(newName.trim(), SourceType.USER_DEFINED);
+                    } else {
+                        symTable.createLabel(addr, newName.trim(), SourceType.USER_DEFINED);
+                    }
+                    success = true;
+                    result.set("Data renamed to '" + newName.trim() + "' at " + addr);
                 }
                 catch (Exception e) {
                     Msg.error(this, "Rename data error", e);
+                    result.set("Error renaming data: " + e.getMessage());
                 }
                 finally {
-                    program.endTransaction(tx, true);
+                    program.endTransaction(tx, success);
                 }
             });
         }
-        catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute rename data on Swing thread", e);
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Rename data interrupted";
         }
+        catch (InvocationTargetException e) {
+            Msg.error(this, "Failed to execute rename data on Swing thread", e);
+            return "Error renaming data: " + e.getMessage();
+        }
+        return result.get();
     }
 
     private String renameVariableInFunction(String programName, String functionName, String oldVarName, String newVarName) {
@@ -759,10 +846,15 @@ public class GhidraMCPPlugin extends Plugin {
                     Msg.error(this, "Failed to rename variable", e);
                 }
                 finally {
-                    successFlag.set(program.endTransaction(tx, true));
+                    program.endTransaction(tx, successFlag.get());
                 }
             });
-        } catch (InterruptedException | InvocationTargetException e) {
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            String errorMsg = "Rename variable interrupted";
+            Msg.error(this, errorMsg, e);
+            return errorMsg;
+        } catch (InvocationTargetException e) {
             String errorMsg = "Failed to execute rename on Swing thread: " + e.getMessage();
             Msg.error(this, errorMsg, e);
             return errorMsg;
@@ -872,18 +964,15 @@ public class GhidraMCPPlugin extends Plugin {
     /**
      * List all functions in the database
      */
-    private String listFunctions(String programName) {
+    private String listFunctions(String programName, int offset, int limit) {
         Program program = getProgramByName(programName);
         if (program == null) return "No program loaded";
 
-        StringBuilder result = new StringBuilder();
+        List<String> result = new ArrayList<>();
         for (Function func : program.getFunctionManager().getFunctions(true)) {
-            result.append(String.format("%s at %s\n", 
-                func.getName(), 
-                func.getEntryPoint()));
+            result.add(String.format("%s at %s", func.getName(), func.getEntryPoint()));
         }
-
-        return result.toString();
+        return paginateList(result, offset, limit);
     }
 
     /**
@@ -947,6 +1036,7 @@ public class GhidraMCPPlugin extends Plugin {
                 if (instr.getAddress().compareTo(end) > 0) {
                     break; // Stop if we've gone past the end of the function
                 }
+                if (!func.getBody().contains(instr.getAddress())) continue;
                 String comment = listing.getComment(CodeUnit.EOL_COMMENT, instr.getAddress());
                 comment = (comment != null) ? "; " + comment : "";
 
@@ -990,6 +1080,104 @@ public class GhidraMCPPlugin extends Plugin {
         }
 
         return success.get();
+    }
+
+    /**
+     * Disassembles undefined bytes, with explicit ARM/Thumb context support.
+     */
+    private String disassembleCode(String programName, String addressStr, String modeStr) {
+        Program program = getProgramByName(programName);
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        String mode = modeStr == null || modeStr.isBlank()
+            ? "auto" : modeStr.trim().toLowerCase(Locale.ROOT);
+        if (!mode.equals("auto") && !mode.equals("arm") && !mode.equals("thumb")) {
+            return "Invalid disassembly mode '" + modeStr + "'; expected auto, arm, or thumb";
+        }
+
+        Address requested;
+        try {
+            requested = program.getAddressFactory().getAddress(addressStr);
+        } catch (Exception e) {
+            return "Invalid address '" + addressStr + "': " + e.getMessage();
+        }
+        if (requested == null) return "Invalid address: " + addressStr;
+
+        Address start = requested;
+        if (mode.equals("thumb")) {
+            start = requested.getNewAddress(requested.getOffset() & ~1L);
+        } else if (mode.equals("arm")) {
+            start = requested.getNewAddress(requested.getOffset() & ~3L);
+        }
+        final Address disassemblyStart = start;
+
+        if (!program.getMemory().contains(disassemblyStart)) {
+            return "Address is not in program memory: " + disassemblyStart;
+        }
+        if ((mode.equals("arm") || mode.equals("thumb")) &&
+                program.getProgramContext().getRegister("TMode") == null) {
+            return "Program language " + program.getLanguageID() +
+                " does not expose the ARM TMode context register";
+        }
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to disassemble code");
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Disassemble code via HTTP");
+                boolean success = false;
+                try {
+                    Listing listing = program.getListing();
+                    Instruction existing = listing.getInstructionAt(disassemblyStart);
+                    if (existing != null) {
+                        result.set("Instruction already defined at " + disassemblyStart +
+                            ": " + existing);
+                        return;
+                    }
+
+                    CodeUnit codeUnit = listing.getCodeUnitContaining(disassemblyStart);
+                    if (codeUnit instanceof Data) {
+                        result.set("Cannot disassemble at " + disassemblyStart +
+                            ": defined data overlaps the address; clear it first");
+                        return;
+                    }
+
+                    DisassembleCommand cmd = mode.equals("auto")
+                        ? new DisassembleCommand(disassemblyStart, null, true)
+                        : new ArmDisassembleCommand(disassemblyStart, null, mode.equals("thumb"));
+                    if (!cmd.applyTo(program, new ConsoleTaskMonitor())) {
+                        String status = cmd.getStatusMsg();
+                        result.set("Failed to disassemble at " + disassemblyStart +
+                            (status == null || status.isEmpty() ? "" : ": " + status));
+                        return;
+                    }
+
+                    Instruction created = listing.getInstructionAt(disassemblyStart);
+                    if (created == null) {
+                        result.set("Ghidra did not create an instruction at " + disassemblyStart);
+                        return;
+                    }
+
+                    success = true;
+                    result.set("Disassembled " + cmd.getDisassembledAddressSet().getNumAddresses() +
+                        " byte(s) from " + disassemblyStart + " in " + mode +
+                        " mode; first instruction: " + created);
+                } catch (Exception e) {
+                    Msg.error(this, "Error disassembling code", e);
+                    result.set("Error disassembling code: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Disassembly interrupted";
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            return "Error disassembling code: " +
+                (cause != null && cause.getMessage() != null ? cause.getMessage() : e.getMessage());
+        }
+        return result.get();
     }
 
     /**
@@ -1077,7 +1265,9 @@ public class GhidraMCPPlugin extends Plugin {
     /**
      * Set a function's prototype with proper error handling using ApplyFunctionSignatureCmd
      */
-    private PrototypeResult setFunctionPrototype(String programName, String functionAddrStr, String prototype) {
+    private PrototypeResult setFunctionPrototype(String programName, String functionAddrStr,
+                                                 String prototype, String callingConvention,
+                                                 String sourceTypeStr) {
         // Input validation
         Program program = getProgramByName(programName);
         if (program == null) return new PrototypeResult(false, "No program loaded");
@@ -1090,11 +1280,23 @@ public class GhidraMCPPlugin extends Plugin {
 
         final StringBuilder errorMessage = new StringBuilder();
         final AtomicBoolean success = new AtomicBoolean(false);
+        final SourceType sourceType;
+        try {
+            sourceType = parseSourceType(sourceTypeStr);
+        } catch (IllegalArgumentException e) {
+            return new PrototypeResult(false, e.getMessage());
+        }
 
         try {
             SwingUtilities.invokeAndWait(() -> 
-                applyFunctionPrototype(program, functionAddrStr, prototype, success, errorMessage));
-        } catch (InterruptedException | InvocationTargetException e) {
+                applyFunctionPrototype(program, functionAddrStr, prototype, callingConvention,
+                    sourceType, success, errorMessage));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            String msg = "Set function prototype interrupted";
+            errorMessage.append(msg);
+            Msg.error(this, msg, e);
+        } catch (InvocationTargetException e) {
             String msg = "Failed to set function prototype on Swing thread: " + e.getMessage();
             errorMessage.append(msg);
             Msg.error(this, msg, e);
@@ -1107,6 +1309,7 @@ public class GhidraMCPPlugin extends Plugin {
      * Helper method that applies the function prototype within a transaction
      */
     private void applyFunctionPrototype(Program program, String functionAddrStr, String prototype, 
+                                       String callingConvention, SourceType sourceType,
                                        AtomicBoolean success, StringBuilder errorMessage) {
         try {
             // Get the address and function
@@ -1122,11 +1325,18 @@ public class GhidraMCPPlugin extends Plugin {
 
             Msg.info(this, "Setting prototype for function " + func.getName() + ": " + prototype);
 
-            // Store original prototype as a comment for reference
-            addPrototypeComment(program, func, prototype);
+            // FunctionSignatureParser may select the program's default convention when the
+            // declaration does not spell one out.  Preserve the existing convention unless
+            // the caller explicitly asks to change it.
+            String effectiveCallingConvention = callingConvention;
+            if (effectiveCallingConvention == null || effectiveCallingConvention.isBlank()) {
+                effectiveCallingConvention = func.getCallingConventionName();
+            }
 
             // Use ApplyFunctionSignatureCmd to parse and apply the signature
-            parseFunctionSignatureAndApply(program, addr, prototype, success, errorMessage);
+            parseFunctionSignatureAndApply(
+                program, addr, func.getSignature(), prototype, effectiveCallingConvention, sourceType,
+                success, errorMessage);
 
         } catch (Exception e) {
             String msg = "Error setting function prototype: " + e.getMessage();
@@ -1136,25 +1346,12 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
-     * Add a comment showing the prototype being set
-     */
-    private void addPrototypeComment(Program program, Function func, String prototype) {
-        int txComment = program.startTransaction("Add prototype comment");
-        try {
-            program.getListing().setComment(
-                func.getEntryPoint(), 
-                CodeUnit.PLATE_COMMENT, 
-                "Setting prototype: " + prototype
-            );
-        } finally {
-            program.endTransaction(txComment, true);
-        }
-    }
-
-    /**
      * Parse and apply the function signature with error handling
      */
-    private void parseFunctionSignatureAndApply(Program program, Address addr, String prototype,
+    private void parseFunctionSignatureAndApply(Program program, Address addr,
+                                              ghidra.program.model.listing.FunctionSignature originalSignature,
+                                              String prototype,
+                                              String callingConvention, SourceType sourceType,
                                               AtomicBoolean success, StringBuilder errorMessage) {
         // Use ApplyFunctionSignatureCmd to parse and apply the signature
         int txProto = program.startTransaction("Set function prototype");
@@ -1171,7 +1368,8 @@ public class GhidraMCPPlugin extends Plugin {
                 new ghidra.app.util.parser.FunctionSignatureParser(dtm, dtms);
 
             // Parse the prototype into a function signature
-            ghidra.program.model.data.FunctionDefinitionDataType sig = parser.parse(null, prototype);
+            ghidra.program.model.data.FunctionDefinitionDataType sig =
+                parser.parse(originalSignature, prototype);
 
             if (sig == null) {
                 String msg = "Failed to parse function prototype";
@@ -1183,12 +1381,21 @@ public class GhidraMCPPlugin extends Plugin {
             // Create and apply the command
             ghidra.app.cmd.function.ApplyFunctionSignatureCmd cmd = 
                 new ghidra.app.cmd.function.ApplyFunctionSignatureCmd(
-                    addr, sig, SourceType.USER_DEFINED);
+                    addr, sig, sourceType);
 
             // Apply the command to the program
             boolean cmdResult = cmd.applyTo(program, new ConsoleTaskMonitor());
 
             if (cmdResult) {
+                Function appliedFunction = program.getFunctionManager().getFunctionAt(addr);
+                if (appliedFunction == null) {
+                    throw new IllegalStateException("Function disappeared after applying signature");
+                }
+                if (callingConvention != null && !callingConvention.isBlank()) {
+                    appliedFunction.setCallingConvention(
+                        normalizeCallingConvention(callingConvention));
+                }
+                appliedFunction.setSignatureSource(sourceType);
                 success.set(true);
                 Msg.info(this, "Successfully applied function signature");
             } else {
@@ -1203,6 +1410,29 @@ public class GhidraMCPPlugin extends Plugin {
         } finally {
             program.endTransaction(txProto, success.get());
         }
+    }
+
+    private SourceType parseSourceType(String sourceTypeStr) {
+        if (sourceTypeStr == null || sourceTypeStr.isBlank()) return SourceType.USER_DEFINED;
+        String normalized = sourceTypeStr.trim().toUpperCase(Locale.ROOT).replace('-', '_');
+        if (normalized.equals("USER")) normalized = "USER_DEFINED";
+        try {
+            return SourceType.valueOf(normalized);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid source_type '" + sourceTypeStr +
+                "'; expected default, analysis, ai, imported, or user_defined");
+        }
+    }
+
+    private String normalizeCallingConvention(String callingConvention) {
+        String normalized = callingConvention.trim();
+        if (normalized.equalsIgnoreCase("unknown")) {
+            return Function.UNKNOWN_CALLING_CONVENTION_STRING;
+        }
+        if (normalized.equalsIgnoreCase("default")) {
+            return Function.DEFAULT_CALLING_CONVENTION_STRING;
+        }
+        return normalized;
     }
 
     /**
@@ -1526,83 +1756,94 @@ public class GhidraMCPPlugin extends Plugin {
      * @return The resolved DataType, or null if not found
      */
     private DataType resolveDataType(DataTypeManager dtm, String typeName) {
-        // First try to find exact match in all categories
-        DataType dataType = findDataTypeByNameInAllCategories(dtm, typeName);
+        if (dtm == null || typeName == null || typeName.trim().isEmpty()) {
+            return null;
+        }
+
+        String requested = typeName.trim();
+
+        // An explicit category path is unambiguous and should win over a name search.
+        if (requested.startsWith("/")) {
+            DataType byPath = dtm.getDataType(requested);
+            if (byPath != null) return byPath;
+        }
+
+        // Preserve exact user-defined names before interpreting C decorations.
+        DataType dataType = findDataTypeByNameInAllCategories(dtm, requested);
         if (dataType != null) {
             Msg.info(this, "Found exact data type match: " + dataType.getPathName());
             return dataType;
         }
 
         // Check for Windows-style pointer types (PXXX)
-        if (typeName.startsWith("P") && typeName.length() > 1) {
-            String baseTypeName = typeName.substring(1);
+        if (requested.startsWith("P") && requested.length() > 1 &&
+                requested.indexOf(' ') < 0 && requested.indexOf('*') < 0) {
+            String baseTypeName = requested.substring(1);
 
             // Special case for PVOID
             if (baseTypeName.equals("VOID")) {
-                return new PointerDataType(dtm.getDataType("/void"));
+                DataType voidType = dtm.getDataType("/void");
+                return voidType == null ? null : dtm.getPointer(voidType);
             }
 
             // Try to find the base type
             DataType baseType = findDataTypeByNameInAllCategories(dtm, baseTypeName);
             if (baseType != null) {
-                return new PointerDataType(baseType);
+                return dtm.getPointer(baseType);
             }
-
-            Msg.warn(this, "Base type not found for " + typeName + ", defaulting to void*");
-            return new PointerDataType(dtm.getDataType("/void"));
         }
 
-        // Handle common built-in types
-        switch (typeName.toLowerCase()) {
-            case "int":
-            case "long":
-                return dtm.getDataType("/int");
+        // Normalize convenience aliases, then let Ghidra parse C pointer/array
+        // decorations (for example "MyStruct *" or "char[32]").
+        String normalized;
+        switch (requested.toLowerCase(Locale.ROOT)) {
             case "uint":
             case "unsigned int":
-            case "unsigned long":
             case "dword":
-                return dtm.getDataType("/uint");
-            case "short":
-                return dtm.getDataType("/short");
+                normalized = "uint";
+                break;
             case "ushort":
             case "unsigned short":
             case "word":
-                return dtm.getDataType("/ushort");
-            case "char":
+                normalized = "ushort";
+                break;
             case "byte":
-                return dtm.getDataType("/char");
+                normalized = "byte";
+                break;
             case "uchar":
             case "unsigned char":
-                return dtm.getDataType("/uchar");
+                normalized = "uchar";
+                break;
             case "longlong":
             case "__int64":
-                return dtm.getDataType("/longlong");
+                normalized = "longlong";
+                break;
             case "ulonglong":
             case "unsigned __int64":
-                return dtm.getDataType("/ulonglong");
-            case "float":
-                return dtm.getDataType("/float");
-            case "double":
-                return dtm.getDataType("/double");
+                normalized = "ulonglong";
+                break;
             case "qword":
-                return dtm.getDataType("/longlong");
+                normalized = "qword";
+                break;
             case "pointer":
-                return new PointerDataType();
+                normalized = "void *";
+                break;
             case "bool":
             case "boolean":
-                return dtm.getDataType("/bool");
-            case "void":
-                return dtm.getDataType("/void");
+                normalized = "bool";
+                break;
             default:
-                // Try as a direct path
-                DataType directType = dtm.getDataType("/" + typeName);
-                if (directType != null) {
-                    return directType;
-                }
+                normalized = requested;
+                break;
+        }
 
-                // Fallback to int if we couldn't find it
-                Msg.warn(this, "Unknown type: " + typeName + ", defaulting to int");
-                return dtm.getDataType("/int");
+        try {
+            DataTypeParser parser = new DataTypeParser(
+                dtm, dtm, null, DataTypeParser.AllowedDataTypes.ALL);
+            return parser.parse(normalized);
+        } catch (Exception e) {
+            Msg.warn(this, "Could not resolve data type '" + requested + "': " + e.getMessage());
+            return null;
         }
     }
     
@@ -1611,32 +1852,26 @@ public class GhidraMCPPlugin extends Plugin {
      * This searches through all categories rather than just the root
      */
     private DataType findDataTypeByNameInAllCategories(DataTypeManager dtm, String typeName) {
-        // Try exact match first
-        DataType result = searchByNameInAllCategories(dtm, typeName);
-        if (result != null) {
-            return result;
-        }
+        if (dtm == null || typeName == null || typeName.isEmpty()) return null;
+        if (typeName.startsWith("/")) return dtm.getDataType(typeName);
 
-        // Try lowercase
-        return searchByNameInAllCategories(dtm, typeName.toLowerCase());
-    }
-
-    /**
-     * Helper method to search for a data type by name in all categories
-     */
-    private DataType searchByNameInAllCategories(DataTypeManager dtm, String name) {
-        // Get all data types from the manager
+        List<DataType> exactMatches = new ArrayList<>();
+        List<DataType> caseInsensitiveMatches = new ArrayList<>();
         Iterator<DataType> allTypes = dtm.getAllDataTypes();
         while (allTypes.hasNext()) {
             DataType dt = allTypes.next();
-            // Check if the name matches exactly (case-sensitive) 
-            if (dt.getName().equals(name)) {
-                return dt;
-            }
-            // For case-insensitive, we want an exact match except for case
-            if (dt.getName().equalsIgnoreCase(name)) {
-                return dt;
-            }
+            if (dt.getName().equals(typeName)) exactMatches.add(dt);
+            else if (dt.getName().equalsIgnoreCase(typeName)) caseInsensitiveMatches.add(dt);
+        }
+
+        List<DataType> matches = exactMatches.isEmpty() ? caseInsensitiveMatches : exactMatches;
+        if (matches.size() == 1) return matches.get(0);
+        for (DataType match : matches) {
+            if (match.getCategoryPath().isRoot()) return match;
+        }
+        if (matches.size() > 1) {
+            Msg.warn(this, "Ambiguous data type name '" + typeName +
+                "'; use a fully-qualified category path");
         }
         return null;
     }
@@ -1654,11 +1889,13 @@ public class GhidraMCPPlugin extends Plugin {
                 boolean success = false;
                 try {
                     Address start = program.getAddressFactory().getAddress(addressStr);
+                    if (start == null) throw new IllegalArgumentException("Invalid address: " + addressStr);
                     Listing listing = program.getListing();
 
                     Address end;
                     if (sizeStr != null && !sizeStr.isEmpty()) {
                         int size = Integer.parseInt(sizeStr);
+                        if (size <= 0) throw new IllegalArgumentException("Size must be positive");
                         end = start.add(size - 1);
                     } else {
                         Data data = listing.getDataAt(start);
@@ -1666,9 +1903,20 @@ public class GhidraMCPPlugin extends Plugin {
                             data = listing.getDataContaining(start);
                         }
                         if (data != null) {
-                            end = start.add(data.getLength() - 1);
+                            start = data.getMinAddress();
+                            end = data.getMaxAddress();
                         } else {
-                            end = start;
+                            result.set("No data defined at " + start);
+                            return;
+                        }
+                    }
+
+                    InstructionIterator instructions = listing.getInstructions(start, true);
+                    if (instructions.hasNext()) {
+                        Instruction instruction = instructions.next();
+                        if (instruction.getAddress().compareTo(end) <= 0) {
+                            throw new IllegalArgumentException("Instruction at " + instruction.getAddress() +
+                                " overlaps the range; clear_data never removes code");
                         }
                     }
 
@@ -1682,51 +1930,20 @@ public class GhidraMCPPlugin extends Plugin {
                     program.endTransaction(tx, success);
                 }
             });
-        } catch (InterruptedException | InvocationTargetException e) {
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            result.set("Clear data interrupted");
+            Msg.error(this, "Clear data interrupted", e);
+        } catch (InvocationTargetException e) {
             Msg.error(this, "Failed to execute clear data on Swing thread", e);
+            result.set("Error clearing data: " + e.getMessage());
         }
 
         return result.get();
     }
 
     private String defineData(String programName, String addressStr, String dataTypeName, String label) {
-        Program program = getProgramByName(programName);
-        if (program == null) return "No program loaded";
-        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
-        if (dataTypeName == null || dataTypeName.isEmpty()) return "Data type is required";
-
-        AtomicReference<String> result = new AtomicReference<>("Failed to define data");
-
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Define data");
-                boolean success = false;
-                try {
-                    Address addr = program.getAddressFactory().getAddress(addressStr);
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    DataType dt = resolveDataType(dtm, dataTypeName);
-
-                    program.getListing().createData(addr, dt);
-
-                    if (label != null && !label.isEmpty()) {
-                        program.getSymbolTable().createLabel(addr, label, SourceType.USER_DEFINED);
-                    }
-
-                    success = true;
-                    result.set("Defined " + dataTypeName + " at " + addr +
-                              (label != null && !label.isEmpty() ? " with label " + label : ""));
-                } catch (Exception e) {
-                    Msg.error(this, "Error defining data", e);
-                    result.set("Error defining data: " + e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success);
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute define data on Swing thread", e);
-        }
-
-        return result.get();
+        return applyDataType(programName, addressStr, dataTypeName, false, label);
     }
 
     private String defineDataBatch(String programName, String jsonBody) {
@@ -1738,6 +1955,7 @@ public class GhidraMCPPlugin extends Plugin {
 
         try {
             JsonArray items = JsonParser.parseString(jsonBody).getAsJsonArray();
+            if (items.isEmpty()) return "Data batch must not be empty";
 
             SwingUtilities.invokeAndWait(() -> {
                 int tx = program.startTransaction("Define data batch");
@@ -1759,7 +1977,12 @@ public class GhidraMCPPlugin extends Plugin {
 
                         try {
                             Address address = program.getAddressFactory().getAddress(addr);
+                            if (address == null) throw new IllegalArgumentException("Invalid address");
                             DataType dt = resolveDataType(dtm, typeName);
+                            if (dt == null) throw new IllegalArgumentException("Unknown data type: " + typeName);
+                            if (dt.getLength() <= 0) {
+                                throw new IllegalArgumentException("Data type has no fixed positive length: " + typeName);
+                            }
                             listing.createData(address, dt);
 
                             if (label != null && !label.isEmpty()) {
@@ -1772,10 +1995,11 @@ public class GhidraMCPPlugin extends Plugin {
                         }
                     }
 
-                    success = succeeded > 0;
-                    result.set("Total: " + items.size() + ", Succeeded: " + succeeded +
-                              ", Failed: " + failed +
-                              (errors.length() > 0 ? "\nErrors:\n" + errors : ""));
+                    success = failed == 0 && succeeded == items.size();
+                    result.set((success ? "Committed. " : "Rolled back. ") +
+                        "Total: " + items.size() + ", Applied: " + succeeded +
+                        ", Failed: " + failed +
+                        (errors.length() > 0 ? "\nErrors:\n" + errors : ""));
                 } catch (Exception e) {
                     Msg.error(this, "Error in define data batch", e);
                     result.set("Error in batch: " + e.getMessage());
@@ -1855,6 +2079,82 @@ public class GhidraMCPPlugin extends Plugin {
         }
     }
 
+    private String listDataTypes(String programName, String query, String category,
+                                 int offset, int limit) {
+        Program program = getProgramByName(programName);
+        if (program == null) return "No program loaded";
+
+        String queryLower = query == null ? "" : query.toLowerCase(Locale.ROOT);
+        String categoryPrefix = category == null ? "" : category.trim();
+        List<String> lines = new ArrayList<>();
+        Iterator<DataType> iterator = program.getDataTypeManager().getAllDataTypes();
+        while (iterator.hasNext()) {
+            DataType dt = iterator.next();
+            String path = dt.getPathName();
+            if (!queryLower.isEmpty() && !path.toLowerCase(Locale.ROOT).contains(queryLower)) continue;
+            if (!categoryPrefix.isEmpty() && !path.startsWith(categoryPrefix)) continue;
+            lines.add(path + "\t" + dataTypeKind(dt) + "\t" + dt.getLength());
+        }
+        Collections.sort(lines);
+        return paginateList(lines, offset, limit);
+    }
+
+    private String getDataTypeDescription(String programName, String name) {
+        Program program = getProgramByName(programName);
+        if (program == null) return "No program loaded";
+        if (name == null || name.trim().isEmpty()) return "Data type name is required";
+
+        DataType dt = resolveDataType(program.getDataTypeManager(), name);
+        if (dt == null) return "Data type not found: " + name;
+
+        StringBuilder result = new StringBuilder();
+        result.append("Path: ").append(dt.getPathName()).append('\n');
+        result.append("Kind: ").append(dataTypeKind(dt)).append('\n');
+        result.append("Size: ").append(dt.getLength()).append(" bytes\n");
+
+        if (dt instanceof Composite) {
+            Composite composite = (Composite) dt;
+            result.append("Alignment: ").append(composite.getAlignment()).append('\n');
+            result.append("Packing: ").append(composite.getPackingType()).append('\n');
+            result.append("Fields:\n");
+            for (DataTypeComponent component : composite.getDefinedComponents()) {
+                result.append("  +").append(component.getOffset()).append("  ")
+                    .append(component.getDataType().getDisplayName()).append("  ")
+                    .append(component.getFieldName() == null ? component.getDefaultFieldName()
+                                                            : component.getFieldName())
+                    .append("  [").append(component.getLength()).append(" bytes]");
+                if (component.getComment() != null && !component.getComment().isEmpty()) {
+                    result.append("  // ").append(component.getComment());
+                }
+                result.append('\n');
+            }
+        } else if (dt instanceof ghidra.program.model.data.Enum) {
+            ghidra.program.model.data.Enum enumType = (ghidra.program.model.data.Enum) dt;
+            result.append("Values:\n");
+            String[] names = enumType.getNames();
+            Arrays.sort(names);
+            for (String entryName : names) {
+                result.append("  ").append(entryName).append(" = ")
+                    .append(enumType.getValue(entryName)).append('\n');
+            }
+        } else if (dt instanceof TypeDef) {
+            result.append("Base type: ").append(((TypeDef) dt).getBaseDataType().getPathName())
+                .append('\n');
+        }
+        return result.toString();
+    }
+
+    private String dataTypeKind(DataType dt) {
+        if (dt instanceof ghidra.program.model.data.Structure) return "struct";
+        if (dt instanceof ghidra.program.model.data.Union) return "union";
+        if (dt instanceof ghidra.program.model.data.Enum) return "enum";
+        if (dt instanceof TypeDef) return "typedef";
+        if (dt instanceof ghidra.program.model.data.Pointer) return "pointer";
+        if (dt instanceof ghidra.program.model.data.Array) return "array";
+        if (dt instanceof ghidra.program.model.data.FunctionDefinition) return "function";
+        return dt.getClass().getSimpleName();
+    }
+
     private String batchRenameFunctions(String programName, String jsonBody) {
         Program program = getProgramByName(programName);
         if (program == null) return "No program loaded";
@@ -1864,6 +2164,7 @@ public class GhidraMCPPlugin extends Plugin {
 
         try {
             JsonArray items = JsonParser.parseString(jsonBody).getAsJsonArray();
+            if (items.isEmpty()) return "Rename batch must not be empty";
 
             SwingUtilities.invokeAndWait(() -> {
                 int tx = program.startTransaction("Batch rename functions");
@@ -1894,10 +2195,11 @@ public class GhidraMCPPlugin extends Plugin {
                         }
                     }
 
-                    success = succeeded > 0;
-                    result.set("Total: " + items.size() + ", Succeeded: " + succeeded +
-                              ", Failed: " + failed +
-                              (errors.length() > 0 ? "\nErrors:\n" + errors : ""));
+                    success = failed == 0 && succeeded == items.size();
+                    result.set((success ? "Committed. " : "Rolled back. ") +
+                        "Total: " + items.size() + ", Applied: " + succeeded +
+                        ", Failed: " + failed +
+                        (errors.length() > 0 ? "\nErrors:\n" + errors : ""));
                 } catch (Exception e) {
                     Msg.error(this, "Error in batch rename", e);
                     result.set("Error in batch: " + e.getMessage());
@@ -1925,6 +2227,7 @@ public class GhidraMCPPlugin extends Plugin {
             int commentType = "disassembly".equalsIgnoreCase(commentTypeStr)
                     ? CodeUnit.EOL_COMMENT : CodeUnit.PRE_COMMENT;
             JsonArray comments = body.getAsJsonArray("comments");
+            if (comments == null || comments.isEmpty()) return "Comments batch must not be empty";
 
             SwingUtilities.invokeAndWait(() -> {
                 int tx = program.startTransaction("Batch set comments");
@@ -1951,10 +2254,11 @@ public class GhidraMCPPlugin extends Plugin {
                         }
                     }
 
-                    success = succeeded > 0;
-                    result.set("Total: " + comments.size() + ", Succeeded: " + succeeded +
-                              ", Failed: " + failed +
-                              (errors.length() > 0 ? "\nErrors:\n" + errors : ""));
+                    success = failed == 0 && succeeded == comments.size();
+                    result.set((success ? "Committed. " : "Rolled back. ") +
+                        "Total: " + comments.size() + ", Applied: " + succeeded +
+                        ", Failed: " + failed +
+                        (errors.length() > 0 ? "\nErrors:\n" + errors : ""));
                 } catch (Exception e) {
                     Msg.error(this, "Error in batch set comments", e);
                     result.set("Error in batch: " + e.getMessage());
@@ -2015,6 +2319,101 @@ public class GhidraMCPPlugin extends Plugin {
         return result.get();
     }
 
+    /**
+     * Creates a function at an already-disassembled instruction.
+     *
+     * A label is only a symbol, so converting LAB_* into something the
+     * decompiler can consume requires a real Function object.  CreateFunctionCmd
+     * computes the function body using the same logic as Ghidra's Create
+     * Function action.
+     */
+    private String createFunction(String programName, String addressStr, String name) {
+        Program program = getProgramByName(programName);
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        Address addr;
+        try {
+            addr = program.getAddressFactory().getAddress(addressStr);
+        } catch (Exception e) {
+            return "Invalid address '" + addressStr + "': " + e.getMessage();
+        }
+        if (addr == null) return "Invalid address: " + addressStr;
+        if (!program.getMemory().contains(addr)) return "Address is not in program memory: " + addr;
+
+        String requestedName = (name == null || name.trim().isEmpty()) ? null : name.trim();
+        AtomicReference<String> result = new AtomicReference<>("Failed to create function");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create function via HTTP");
+                boolean success = false;
+                try {
+                    FunctionManager functionManager = program.getFunctionManager();
+                    Function existing = functionManager.getFunctionAt(addr);
+                    if (existing != null) {
+                        result.set("Function already exists: " + existing.getName() +
+                            " at " + existing.getEntryPoint());
+                        return;
+                    }
+
+                    Function containing = functionManager.getFunctionContaining(addr);
+                    if (containing != null) {
+                        result.set("Cannot create function at " + addr +
+                            ": address is inside function " + containing.getName() +
+                            " at " + containing.getEntryPoint());
+                        return;
+                    }
+
+                    if (program.getListing().getInstructionAt(addr) == null) {
+                        result.set("Cannot create function at " + addr +
+                            ": no instruction is defined at this address; disassemble it first");
+                        return;
+                    }
+
+                    CreateFunctionCmd cmd = requestedName == null
+                        ? new CreateFunctionCmd(addr)
+                        : new CreateFunctionCmd(requestedName, addr, null, SourceType.USER_DEFINED);
+
+                    if (!cmd.applyTo(program, new ConsoleTaskMonitor())) {
+                        String status = cmd.getStatusMsg();
+                        result.set("Failed to create function at " + addr +
+                            (status == null || status.isEmpty() ? "" : ": " + status));
+                        return;
+                    }
+
+                    Function created = functionManager.getFunctionAt(addr);
+                    if (created == null) {
+                        result.set("Failed to create function at " + addr +
+                            ": Ghidra reported success but no function was created");
+                        return;
+                    }
+
+                    success = true;
+                    result.set("Function created: " + created.getName() + " at " +
+                        created.getEntryPoint() + " (body " + created.getBody().getMinAddress() +
+                        " - " + created.getBody().getMaxAddress() + ")");
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating function", e);
+                    result.set("Error creating function: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            Msg.error(this, "Create function interrupted", e);
+            return "Create function interrupted";
+        } catch (InvocationTargetException e) {
+            Msg.error(this, "Failed to execute create function on Swing thread", e);
+            Throwable cause = e.getCause();
+            return "Error creating function: " +
+                (cause != null && cause.getMessage() != null ? cause.getMessage() : e.getMessage());
+        }
+
+        return result.get();
+    }
+
     private String createEnum(String programName, String jsonBody) {
         Program program = getProgramByName(programName);
         if (program == null) return "No program loaded";
@@ -2024,16 +2423,23 @@ public class GhidraMCPPlugin extends Plugin {
 
         try {
             JsonObject body = JsonParser.parseString(jsonBody).getAsJsonObject();
-            String name = body.get("name").getAsString();
+            String name = getRequiredJsonString(body, "name");
             int size = body.has("size") ? body.get("size").getAsInt() : 4;
             JsonArray values = body.getAsJsonArray("values");
+            if (size != 1 && size != 2 && size != 4 && size != 8) {
+                return "Enum size must be 1, 2, 4, or 8 bytes";
+            }
+            if (values == null || values.isEmpty()) return "Enum values are required";
+            CategoryPath category = getCategoryPath(body);
+            String description = getOptionalJsonString(body, "description");
 
             SwingUtilities.invokeAndWait(() -> {
                 int tx = program.startTransaction("Create enum");
                 boolean success = false;
                 try {
                     DataTypeManager dtm = program.getDataTypeManager();
-                    EnumDataType enumType = new EnumDataType(name, size);
+                    EnumDataType enumType = new EnumDataType(category, name, size, dtm);
+                    if (description != null) enumType.setDescription(description);
 
                     for (JsonElement el : values) {
                         JsonObject entry = el.getAsJsonObject();
@@ -2042,9 +2448,10 @@ public class GhidraMCPPlugin extends Plugin {
                         enumType.add(entryName, entryValue);
                     }
 
-                    dtm.addDataType(enumType, DataTypeConflictHandler.REPLACE_HANDLER);
+                    DataType stored = dtm.addDataType(enumType, DataTypeConflictHandler.REPLACE_HANDLER);
                     success = true;
-                    result.set("Enum '" + name + "' created with " + values.size() + " values");
+                    result.set("Enum '" + stored.getPathName() + "' created with " +
+                        values.size() + " values (" + stored.getLength() + " bytes)");
                 } catch (Exception e) {
                     Msg.error(this, "Error creating enum", e);
                     result.set("Error creating enum: " + e.getMessage());
@@ -2068,34 +2475,38 @@ public class GhidraMCPPlugin extends Plugin {
 
         try {
             JsonObject body = JsonParser.parseString(jsonBody).getAsJsonObject();
-            String name = body.get("name").getAsString();
+            String name = getRequiredJsonString(body, "name");
             JsonArray fields = body.getAsJsonArray("fields");
+            if (fields == null) return "Struct fields are required";
+            CategoryPath category = getCategoryPath(body);
+            int requestedSize = body.has("size") ? body.get("size").getAsInt() : 0;
+            if (requestedSize < 0) return "Struct size cannot be negative";
 
             SwingUtilities.invokeAndWait(() -> {
                 int tx = program.startTransaction("Create struct");
                 boolean success = false;
                 try {
                     DataTypeManager dtm = program.getDataTypeManager();
-                    StructureDataType struct = new StructureDataType(name, 0);
-
-                    for (JsonElement el : fields) {
-                        JsonObject field = el.getAsJsonObject();
-                        String fieldName = field.get("name").getAsString();
-                        String fieldType = field.get("type").getAsString();
-                        int fieldSize = field.has("size") ? field.get("size").getAsInt() : 0;
-
-                        DataType dt = resolveDataType(dtm, fieldType);
-                        if (fieldSize > 0) {
-                            struct.add(dt, fieldSize, fieldName, null);
-                        } else {
-                            struct.add(dt, dt.getLength(), fieldName, null);
-                        }
+                    StructureDataType candidate = new StructureDataType(category, name, 0, dtm);
+                    DataType stored = dtm.addDataType(candidate, DataTypeConflictHandler.REPLACE_HANDLER);
+                    if (!(stored instanceof ghidra.program.model.data.Structure)) {
+                        throw new IllegalArgumentException("A non-struct type already uses " + stored.getPathName());
                     }
-
-                    dtm.addDataType(struct, DataTypeConflictHandler.REPLACE_HANDLER);
+                    ghidra.program.model.data.Structure struct =
+                        (ghidra.program.model.data.Structure) stored;
+                    while (struct.getNumComponents() > 0) struct.delete(0);
+                    configureComposite(struct, body);
+                    addCompositeFields(struct, fields, dtm, true);
+                    if (requestedSize > 0) {
+                        if (struct.getLength() > requestedSize) {
+                            throw new IllegalArgumentException("Fields require " + struct.getLength() +
+                                " bytes, exceeding requested struct size " + requestedSize);
+                        }
+                        struct.setLength(requestedSize);
+                    }
                     success = true;
-                    result.set("Struct '" + name + "' created with " + fields.size() +
-                              " fields, total size: " + struct.getLength() + " bytes");
+                    result.set("Struct '" + struct.getPathName() + "' created with " + fields.size() +
+                        " fields, total size: " + struct.getLength() + " bytes");
                 } catch (Exception e) {
                     Msg.error(this, "Error creating struct", e);
                     result.set("Error creating struct: " + e.getMessage());
@@ -2110,48 +2521,286 @@ public class GhidraMCPPlugin extends Plugin {
         return result.get();
     }
 
-    private String applyStruct(String programName, String addressStr, String structName) {
+    private String createUnion(String programName, String jsonBody) {
         Program program = getProgramByName(programName);
         if (program == null) return "No program loaded";
-        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
-        if (structName == null || structName.isEmpty()) return "Struct name is required";
+        if (jsonBody == null || jsonBody.isEmpty()) return "JSON body is required";
 
-        AtomicReference<String> result = new AtomicReference<>("Failed to apply struct");
-
+        AtomicReference<String> result = new AtomicReference<>("Failed to create union");
         try {
+            JsonObject body = JsonParser.parseString(jsonBody).getAsJsonObject();
+            String name = getRequiredJsonString(body, "name");
+            JsonArray fields = body.getAsJsonArray("fields");
+            if (fields == null || fields.isEmpty()) return "Union fields are required";
+            CategoryPath category = getCategoryPath(body);
+
             SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Apply struct");
+                int tx = program.startTransaction("Create union");
                 boolean success = false;
                 try {
-                    Address addr = program.getAddressFactory().getAddress(addressStr);
                     DataTypeManager dtm = program.getDataTypeManager();
-                    DataType dt = findDataTypeByNameInAllCategories(dtm, structName);
-
-                    if (dt == null) {
-                        result.set("Struct '" + structName + "' not found");
-                        return;
+                    UnionDataType candidate = new UnionDataType(category, name, dtm);
+                    DataType stored = dtm.addDataType(candidate, DataTypeConflictHandler.REPLACE_HANDLER);
+                    if (!(stored instanceof ghidra.program.model.data.Union)) {
+                        throw new IllegalArgumentException("A non-union type already uses " + stored.getPathName());
                     }
-
-                    Listing listing = program.getListing();
-                    // Clear existing data at the address range
-                    listing.clearCodeUnits(addr, addr.add(dt.getLength() - 1), false);
-                    listing.createData(addr, dt);
-
+                    ghidra.program.model.data.Union union = (ghidra.program.model.data.Union) stored;
+                    while (union.getNumComponents() > 0) union.delete(0);
+                    configureComposite(union, body);
+                    addCompositeFields(union, fields, dtm, false);
                     success = true;
-                    result.set("Applied struct '" + structName + "' at " + addr +
-                              " (" + dt.getLength() + " bytes)");
+                    result.set("Union '" + union.getPathName() + "' created with " + fields.size() +
+                        " fields, total size: " + union.getLength() + " bytes");
                 } catch (Exception e) {
-                    Msg.error(this, "Error applying struct", e);
-                    result.set("Error applying struct: " + e.getMessage());
+                    Msg.error(this, "Error creating union", e);
+                    result.set("Error creating union: " + e.getMessage());
                 } finally {
                     program.endTransaction(tx, success);
                 }
             });
-        } catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute apply struct on Swing thread", e);
+        } catch (Exception e) {
+            result.set("Error parsing JSON: " + e.getMessage());
         }
-
         return result.get();
+    }
+
+    private String createTypedef(String programName, String jsonBody) {
+        Program program = getProgramByName(programName);
+        if (program == null) return "No program loaded";
+        if (jsonBody == null || jsonBody.isEmpty()) return "JSON body is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to create typedef");
+        try {
+            JsonObject body = JsonParser.parseString(jsonBody).getAsJsonObject();
+            String name = getRequiredJsonString(body, "name");
+            String baseTypeName = getRequiredJsonString(body, "base_type");
+            CategoryPath category = getCategoryPath(body);
+
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create typedef");
+                boolean success = false;
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType baseType = resolveDataType(dtm, baseTypeName);
+                    if (baseType == null) {
+                        throw new IllegalArgumentException("Unknown base data type: " + baseTypeName);
+                    }
+                    TypedefDataType typedef = new TypedefDataType(category, name, baseType, dtm);
+                    DataType stored = dtm.addDataType(typedef, DataTypeConflictHandler.REPLACE_HANDLER);
+                    success = true;
+                    result.set("Typedef '" + stored.getPathName() + "' created for " +
+                        baseType.getDisplayName() + " (" + stored.getLength() + " bytes)");
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating typedef", e);
+                    result.set("Error creating typedef: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (Exception e) {
+            result.set("Error parsing JSON: " + e.getMessage());
+        }
+        return result.get();
+    }
+
+    private String parseCTypes(String programName, String jsonBody) {
+        Program program = getProgramByName(programName);
+        if (program == null) return "No program loaded";
+        if (jsonBody == null || jsonBody.isEmpty()) return "JSON body is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to parse C types");
+        try {
+            JsonObject body = JsonParser.parseString(jsonBody).getAsJsonObject();
+            String code = getRequiredJsonString(body, "code");
+            CategoryPath category = getCategoryPath(body);
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Parse C data types");
+                boolean success = false;
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    Set<Long> existingIds = new HashSet<>();
+                    Iterator<DataType> beforeIterator = dtm.getAllDataTypes();
+                    while (beforeIterator.hasNext()) existingIds.add(dtm.getID(beforeIterator.next()));
+                    int before = dtm.getDataTypeCount(false);
+                    CParser parser = new CParser(dtm, true, new DataTypeManager[0]);
+                    DataType last = parser.parse(code);
+                    int added = Math.max(0, dtm.getDataTypeCount(false) - before);
+                    if (!category.isRoot()) {
+                        dtm.createCategory(category);
+                        Iterator<DataType> afterIterator = dtm.getAllDataTypes();
+                        while (afterIterator.hasNext()) {
+                            DataType parsedType = afterIterator.next();
+                            if (!existingIds.contains(dtm.getID(parsedType)) &&
+                                    (parsedType instanceof Composite ||
+                                     parsedType instanceof ghidra.program.model.data.Enum ||
+                                     parsedType instanceof TypeDef ||
+                                     parsedType instanceof ghidra.program.model.data.FunctionDefinition)) {
+                                parsedType.setCategoryPath(category);
+                            }
+                        }
+                    }
+                    String messages = parser.getParseMessages();
+                    success = true;
+                    result.set("C declarations parsed; data types added: " + added +
+                        "; category: " + category.getPath() +
+                        (last == null ? "" : "; last type: " + last.getPathName()) +
+                        (messages == null || messages.isBlank() ? "" : "\nParser messages:\n" + messages));
+                } catch (Exception e) {
+                    Msg.error(this, "Error parsing C types", e);
+                    result.set("Error parsing C types: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (Exception e) {
+            result.set("Error parsing JSON: " + e.getMessage());
+        }
+        return result.get();
+    }
+
+    private void configureComposite(Composite composite, JsonObject body) {
+        String description = getOptionalJsonString(body, "description");
+        if (description != null) composite.setDescription(description);
+        boolean packed = body.has("packed") && body.get("packed").getAsBoolean();
+        int packing = body.has("packing") ? body.get("packing").getAsInt() : 0;
+        int alignment = body.has("alignment") ? body.get("alignment").getAsInt() : 0;
+        if (packing < 0 || alignment < 0) {
+            throw new IllegalArgumentException("Packing and alignment cannot be negative");
+        }
+        if (packing > 0) composite.setExplicitPackingValue(packing);
+        else composite.setPackingEnabled(packed);
+        if (alignment > 0) composite.setExplicitMinimumAlignment(alignment);
+    }
+
+    private void addCompositeFields(Composite composite, JsonArray fields, DataTypeManager dtm,
+                                    boolean allowOffsets) throws Exception {
+        for (JsonElement element : fields) {
+            JsonObject field = element.getAsJsonObject();
+            String fieldName = getRequiredJsonString(field, "name");
+            String fieldType = getRequiredJsonString(field, "type");
+            String comment = getOptionalJsonString(field, "comment");
+            DataType dt = resolveDataType(dtm, fieldType);
+            if (dt == null) throw new IllegalArgumentException("Unknown field type: " + fieldType);
+
+            if (field.has("bit_size")) {
+                if (field.has("offset")) {
+                    throw new IllegalArgumentException("Explicit offsets for bit-fields are not supported; use C declarations");
+                }
+                composite.addBitField(dt, field.get("bit_size").getAsInt(), fieldName, comment);
+                continue;
+            }
+
+            int fieldSize = field.has("size") ? field.get("size").getAsInt() : dt.getLength();
+            if (fieldSize <= 0) {
+                throw new IllegalArgumentException("Field '" + fieldName +
+                    "' requires an explicit positive size");
+            }
+            if (field.has("offset")) {
+                if (!allowOffsets || !(composite instanceof ghidra.program.model.data.Structure)) {
+                    throw new IllegalArgumentException("Explicit offsets are only valid for structs");
+                }
+                int offset = field.get("offset").getAsInt();
+                if (offset < 0) throw new IllegalArgumentException("Field offset cannot be negative");
+                ((ghidra.program.model.data.Structure) composite).insertAtOffset(
+                    offset, dt, fieldSize, fieldName, comment);
+            } else {
+                composite.add(dt, fieldSize, fieldName, comment);
+            }
+        }
+    }
+
+    private CategoryPath getCategoryPath(JsonObject body) {
+        String category = getOptionalJsonString(body, "category");
+        if (category == null || category.isBlank() || category.equals("/")) return CategoryPath.ROOT;
+        if (!category.startsWith("/")) category = "/" + category;
+        return new CategoryPath(category);
+    }
+
+    private String getRequiredJsonString(JsonObject body, String key) {
+        String value = getOptionalJsonString(body, key);
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("JSON field '" + key + "' is required");
+        }
+        return value.trim();
+    }
+
+    private String getOptionalJsonString(JsonObject body, String key) {
+        return body.has(key) && !body.get(key).isJsonNull() ? body.get(key).getAsString() : null;
+    }
+
+    private String applyDataType(String programName, String addressStr, String dataTypeName,
+                                 boolean clearExisting, String label) {
+        Program program = getProgramByName(programName);
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (dataTypeName == null || dataTypeName.isBlank()) return "Data type is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to apply data type");
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Apply data type via HTTP");
+                boolean success = false;
+                try {
+                    Address start = program.getAddressFactory().getAddress(addressStr);
+                    if (start == null) throw new IllegalArgumentException("Invalid address: " + addressStr);
+                    DataType dt = resolveDataType(program.getDataTypeManager(), dataTypeName);
+                    if (dt == null) throw new IllegalArgumentException("Unknown data type: " + dataTypeName);
+                    if (dt.getLength() <= 0) {
+                        throw new IllegalArgumentException("Data type has no fixed positive length: " +
+                            dt.getDisplayName());
+                    }
+                    Address end = start.add(dt.getLength() - 1L);
+                    if (!program.getMemory().contains(start) || !program.getMemory().contains(end)) {
+                        throw new IllegalArgumentException("Data type range " + start + " - " + end +
+                            " is outside program memory");
+                    }
+
+                    Listing listing = program.getListing();
+                    InstructionIterator instructions = listing.getInstructions(start, true);
+                    if (instructions.hasNext()) {
+                        Instruction instruction = instructions.next();
+                        if (instruction.getAddress().compareTo(end) <= 0) {
+                            throw new IllegalArgumentException("Instruction at " + instruction.getAddress() +
+                                " overlaps the target range; code is never cleared automatically");
+                        }
+                    }
+
+                    if (clearExisting) listing.clearCodeUnits(start, end, false);
+                    Data created = listing.createData(start, dt);
+                    if (label != null && !label.isBlank()) {
+                        program.getSymbolTable().createLabel(
+                            start, label.trim(), SourceType.USER_DEFINED);
+                    }
+                    success = true;
+                    result.set("Applied " + created.getDataType().getPathName() + " at " + start +
+                        " (" + created.getLength() + " bytes)" +
+                        (label == null || label.isBlank() ? "" : "; label: " + label.trim()));
+                } catch (Exception e) {
+                    Msg.error(this, "Error applying data type", e);
+                    result.set("Error applying data type: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Apply data type interrupted";
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            return "Error applying data type: " +
+                (cause != null && cause.getMessage() != null ? cause.getMessage() : e.getMessage());
+        }
+        return result.get();
+    }
+
+    private String applyStruct(String programName, String addressStr, String structName) {
+        Program program = getProgramByName(programName);
+        if (program == null) return "No program loaded";
+        DataType dt = resolveDataType(program.getDataTypeManager(), structName);
+        if (!(dt instanceof ghidra.program.model.data.Structure)) {
+            return "Struct '" + structName + "' not found";
+        }
+        return applyDataType(programName, addressStr, structName, true, null);
     }
 
     // ----------------------------------------------------------------------------------
@@ -2167,7 +2816,7 @@ public class GhidraMCPPlugin extends Plugin {
         if (query != null) {
             String[] pairs = query.split("&");
             for (String p : pairs) {
-                String[] kv = p.split("=");
+                String[] kv = p.split("=", 2);
                 if (kv.length == 2) {
                     // URL decode parameter values
                     try {
@@ -2198,7 +2847,7 @@ public class GhidraMCPPlugin extends Plugin {
         String bodyStr = new String(body, StandardCharsets.UTF_8);
         Map<String, String> params = new HashMap<>();
         for (String pair : bodyStr.split("&")) {
-            String[] kv = pair.split("=");
+            String[] kv = pair.split("=", 2);
             if (kv.length == 2) {
                 // URL decode parameter values
                 try {
@@ -2238,6 +2887,13 @@ public class GhidraMCPPlugin extends Plugin {
         catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    private boolean parseBooleanOrDefault(String val, boolean defaultValue) {
+        if (val == null || val.isBlank()) return defaultValue;
+        if (val.equalsIgnoreCase("true") || val.equals("1") || val.equalsIgnoreCase("yes")) return true;
+        if (val.equalsIgnoreCase("false") || val.equals("0") || val.equalsIgnoreCase("no")) return false;
+        return defaultValue;
     }
 
     /**

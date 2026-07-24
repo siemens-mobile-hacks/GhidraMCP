@@ -33,7 +33,7 @@ def safe_get(endpoint: str, params: dict = None) -> list:
     url = urljoin(ghidra_server_url, endpoint)
 
     try:
-        response = requests.get(url, params=params, timeout=5)
+        response = requests.get(url, params=params, timeout=30)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.splitlines()
@@ -46,9 +46,9 @@ def safe_post(endpoint: str, data: dict | str, params: dict = None) -> str:
     try:
         url = urljoin(ghidra_server_url, endpoint)
         if isinstance(data, dict):
-            response = requests.post(url, data=data, params=params, timeout=5)
+            response = requests.post(url, data=data, params=params, timeout=30)
         else:
-            response = requests.post(url, data=data.encode("utf-8"), params=params, timeout=5)
+            response = requests.post(url, data=data.encode("utf-8"), params=params, timeout=30)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.strip()
@@ -218,11 +218,11 @@ def get_current_function() -> str:
     return "\n".join(safe_get("get_current_function"))
 
 @mcp.tool()
-def list_functions(program: str = "") -> list:
+def list_functions(offset: int = 0, limit: int = 1000, program: str = "") -> list:
     """
     List all functions in the database.
     """
-    return safe_get("list_functions", _with_program({}, program))
+    return safe_get("list_functions", _with_program({"offset": offset, "limit": limit}, program))
 
 @mcp.tool()
 def decompile_function_by_address(address: str, program: str = "") -> str:
@@ -237,6 +237,20 @@ def disassemble_function(address: str, program: str = "") -> list:
     Get assembly code (address: instruction; comment) for a function.
     """
     return safe_get("disassemble_function", _with_program({"address": address}, program))
+
+@mcp.tool()
+def disassemble_code(address: str, mode: str = "auto", program: str = "") -> str:
+    """
+    Disassemble code starting at an undefined address.
+
+    mode may be "auto", "arm", or "thumb". ARM/Thumb mode uses Ghidra's
+    architecture-specific disassembly command and sets the TMode context.
+    Existing code or data is not cleared automatically.
+    """
+    return safe_post("disassemble_code", _with_program({
+        "address": address,
+        "mode": mode,
+    }, program))
 
 @mcp.tool()
 def set_decompiler_comment(address: str, comment: str, program: str = "") -> str:
@@ -260,11 +274,19 @@ def rename_function_by_address(function_address: str, new_name: str, program: st
     return safe_post("rename_function_by_address", _with_program({"function_address": function_address, "new_name": new_name}, program))
 
 @mcp.tool()
-def set_function_prototype(function_address: str, prototype: str, program: str = "") -> str:
+def set_function_prototype(function_address: str, prototype: str,
+                           calling_convention: str = "",
+                           source_type: str = "user_defined",
+                           program: str = "") -> str:
     """
     Set a function's prototype.
     """
-    return safe_post("set_function_prototype", _with_program({"function_address": function_address, "prototype": prototype}, program))
+    return safe_post("set_function_prototype", _with_program({
+        "function_address": function_address,
+        "prototype": prototype,
+        "calling_convention": calling_convention,
+        "source_type": source_type,
+    }, program))
 
 @mcp.tool()
 def set_local_variable_type(function_address: str, variable_name: str, new_type: str, program: str = "") -> str:
@@ -387,6 +409,18 @@ def get_data_at(address: str, program: str = "") -> str:
     return "\n".join(safe_get("get_data_at", _with_program({"address": address}, program)))
 
 @mcp.tool()
+def list_data_types(query: str = "", category: str = "", offset: int = 0,
+                    limit: int = 100, program: str = "") -> list:
+    """List program data types, optionally filtered by name/path and category."""
+    params = {"query": query, "category": category, "offset": offset, "limit": limit}
+    return safe_get("list_data_types", _with_program(params, program))
+
+@mcp.tool()
+def get_data_type(name: str, program: str = "") -> str:
+    """Describe a data type, including struct/union fields or enum values."""
+    return "\n".join(safe_get("get_data_type", _with_program({"name": name}, program)))
+
+@mcp.tool()
 def batch_rename_functions(renames: list[dict], program: str = "") -> str:
     """
     Rename multiple functions in one transaction.
@@ -417,27 +451,100 @@ def create_label(address: str, name: str, namespace: str = None, program: str = 
     return safe_post("create_label", _with_program(data, program))
 
 @mcp.tool()
-def create_enum(name: str, values: list[dict], size: int = 4, program: str = "") -> str:
+def create_function(address: str, name: str = None, program: str = "") -> str:
+    """
+    Create a function at an existing instruction.
+
+    If name is omitted, Ghidra keeps a suitable label at the entry point or
+    assigns its default FUN_* name. The address must not be inside another
+    function.
+    """
+    data = {"address": address}
+    if name:
+        data["name"] = name
+    return safe_post("create_function", _with_program(data, program))
+
+@mcp.tool()
+def create_enum(name: str, values: list[dict], size: int = 4, category: str = "/",
+                description: str = "", program: str = "") -> str:
     """
     Create an enum data type. Each value: {"name": "MEMBER_NAME", "value": 0}
     """
     return safe_post_json("create_enum", {
         "name": name,
         "size": size,
-        "values": values
+        "category": category,
+        "description": description,
+        "values": values,
     }, _with_program({}, program))
 
 @mcp.tool()
-def create_struct(name: str, fields: list[dict], program: str = "") -> str:
+def create_struct(name: str, fields: list[dict], category: str = "/", size: int = 0,
+                  packed: bool = False, packing: int = 0, alignment: int = 0,
+                  description: str = "", program: str = "") -> str:
     """
     Create a structure data type.
-    Each field: {"name": "field_name", "type": "int", "size": 4}
-    If size is omitted, the type's natural size is used.
+    Each field accepts name, type, and optional size, offset, comment, or bit_size.
+    Type strings may include pointers and arrays, e.g. "Node *" or "char[32]".
     """
     return safe_post_json("create_struct", {
         "name": name,
-        "fields": fields
+        "category": category,
+        "size": size,
+        "packed": packed,
+        "packing": packing,
+        "alignment": alignment,
+        "description": description,
+        "fields": fields,
     }, _with_program({}, program))
+
+@mcp.tool()
+def create_union(name: str, fields: list[dict], category: str = "/",
+                 packed: bool = False, packing: int = 0, alignment: int = 0,
+                 description: str = "", program: str = "") -> str:
+    """Create or replace a union data type using the same field format as create_struct."""
+    return safe_post_json("create_union", {
+        "name": name,
+        "category": category,
+        "packed": packed,
+        "packing": packing,
+        "alignment": alignment,
+        "description": description,
+        "fields": fields,
+    }, _with_program({}, program))
+
+@mcp.tool()
+def create_typedef(name: str, base_type: str, category: str = "/", program: str = "") -> str:
+    """Create or replace a typedef. The base type may be a pointer or array expression."""
+    return safe_post_json("create_typedef", {
+        "name": name,
+        "base_type": base_type,
+        "category": category,
+    }, _with_program({}, program))
+
+@mcp.tool()
+def parse_c_types(code: str, category: str = "/", program: str = "") -> str:
+    """
+    Parse C declarations with Ghidra's native CParser and add the resulting
+    structs, unions, enums, typedefs, and function definitions to the program.
+    """
+    return safe_post_json("parse_c_types", {
+        "code": code,
+        "category": category,
+    }, _with_program({}, program))
+
+@mcp.tool()
+def apply_data_type(address: str, data_type: str, clear_existing: bool = True,
+                    label: str = None, program: str = "") -> str:
+    """Apply any fixed-length data type at an address without deleting instructions."""
+    data = {
+        "address": address,
+        "data_type": data_type,
+        "clear_existing": str(clear_existing).lower(),
+    }
+    if label:
+        data["label"] = label
+    return safe_post("apply_data_type", _with_program(data, program))
 
 @mcp.tool()
 def apply_struct(address: str, struct_name: str, program: str = "") -> str:
@@ -445,7 +552,7 @@ def apply_struct(address: str, struct_name: str, program: str = "") -> str:
     Apply a previously created struct type at a memory address.
     Clears existing data at the address range and stamps the struct.
     """
-    return safe_post("apply_struct", _with_program({"address": address, "struct_name": struct_name}, program))
+    return apply_data_type(address, struct_name, True, None, program)
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
