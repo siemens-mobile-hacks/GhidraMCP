@@ -451,9 +451,12 @@ def create_label(address: str, name: str, namespace: str = None, program: str = 
     return safe_post("create_label", _with_program(data, program))
 
 @mcp.tool()
-def create_function(address: str, name: str = None, program: str = "") -> str:
+def create_function(address: str, name: str = None,
+                    disassemble_if_needed: bool = False,
+                    program: str = "") -> str:
     """
-    Create a function at an existing instruction.
+    Create a function at an existing instruction. If disassemble_if_needed is
+    true and no instruction exists, disassemble from the entry point first.
 
     If name is omitted, Ghidra keeps a suitable label at the entry point or
     assigns its default FUN_* name. The address must not be inside another
@@ -462,6 +465,8 @@ def create_function(address: str, name: str = None, program: str = "") -> str:
     data = {"address": address}
     if name:
         data["name"] = name
+    if disassemble_if_needed:
+        data["disassemble_if_needed"] = True
     return safe_post("create_function", _with_program(data, program))
 
 @mcp.tool()

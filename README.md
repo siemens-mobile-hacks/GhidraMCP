@@ -36,13 +36,17 @@ this fork adds:
 - Native function creation through `create_function`. A label such as `LAB_*`
   is not treated as a function automatically: an instruction must exist at the
   requested entry point, and creation is rejected inside another function.
+  Pass `disassemble_if_needed=true` to disassemble an undefined entry point and
+  create the function in one MCP call.
   This matches Ghidra's distinction between symbols and `Function` objects,
   which are the objects accepted by the decompiler.
 - ARM/Thumb-aware `disassemble_code` with `auto`, `arm`, and `thumb` modes.
   Existing instructions are preserved, and explicitly defined data must be
   cleared before it can be converted to code. Ghidra's one-byte `undefined`
   data units, including those created for raw firmware imports, are treated as
-  disassemblable bytes and do not trigger the defined-data overlap guard.
+  disassemblable bytes and do not trigger the defined-data overlap guard. A
+  successful response is returned only after the transaction completes and the
+  instruction is confirmed in the listing.
 - Data-type tools backed by Ghidra's native `DataTypeParser` and `CParser`:
   inspect, create, and apply structures (including self-references and explicit
   field offsets), unions, enums, typedefs, pointers, arrays, bit fields, and C

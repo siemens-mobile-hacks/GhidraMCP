@@ -465,7 +465,10 @@ public class GhidraMCPPlugin extends Plugin {
             Map<String, String> params = parsePostParams(exchange);
             String address = params.get("address");
             String name = params.get("name");
-            String result = createFunction(params.get("program"), address, name);
+            boolean disassembleIfNeeded = parseBooleanOrDefault(
+                params.get("disassemble_if_needed"), false);
+            String result = createFunction(params.get("program"), address, name,
+                disassembleIfNeeded);
             sendResponse(exchange, result);
         });
 
@@ -1122,10 +1125,9 @@ public class GhidraMCPPlugin extends Plugin {
         }
 
         AtomicReference<String> result = new AtomicReference<>("Failed to disassemble code");
+        AtomicReference<DisassembleCommand> completedCommand = new AtomicReference<>();
         try {
             SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Disassemble code via HTTP");
-                boolean success = false;
                 try {
                     Listing listing = program.getListing();
                     Instruction existing = listing.getInstructionAt(disassemblyStart);
@@ -1145,28 +1147,19 @@ public class GhidraMCPPlugin extends Plugin {
                     DisassembleCommand cmd = mode.equals("auto")
                         ? new DisassembleCommand(disassemblyStart, null, true)
                         : new ArmDisassembleCommand(disassemblyStart, null, mode.equals("thumb"));
-                    if (!cmd.applyTo(program, new ConsoleTaskMonitor())) {
+                    // Keep this endpoint synchronous and deterministic. Incremental analysis can
+                    // open follow-on transactions; callers only requested instruction creation.
+                    cmd.enableCodeAnalysis(false);
+                    if (!tool.execute(cmd, program)) {
                         String status = cmd.getStatusMsg();
                         result.set("Failed to disassemble at " + disassemblyStart +
                             (status == null || status.isEmpty() ? "" : ": " + status));
                         return;
                     }
-
-                    Instruction created = listing.getInstructionAt(disassemblyStart);
-                    if (created == null) {
-                        result.set("Ghidra did not create an instruction at " + disassemblyStart);
-                        return;
-                    }
-
-                    success = true;
-                    result.set("Disassembled " + cmd.getDisassembledAddressSet().getNumAddresses() +
-                        " byte(s) from " + disassemblyStart + " in " + mode +
-                        " mode; first instruction: " + created);
+                    completedCommand.set(cmd);
                 } catch (Exception e) {
                     Msg.error(this, "Error disassembling code", e);
                     result.set("Error disassembling code: " + e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success);
                 }
             });
         } catch (InterruptedException e) {
@@ -1177,7 +1170,44 @@ public class GhidraMCPPlugin extends Plugin {
             return "Error disassembling code: " +
                 (cause != null && cause.getMessage() != null ? cause.getMessage() : e.getMessage());
         }
+
+        DisassembleCommand cmd = completedCommand.get();
+        if (cmd == null) return result.get();
+
+        try {
+            if (!waitForToolCommands(10_000)) {
+                return "Failed to disassemble at " + disassemblyStart +
+                    ": Ghidra did not finish the disassembly transaction within 10 seconds";
+            }
+            SwingUtilities.invokeAndWait(() -> {
+                Instruction created = program.getListing().getInstructionAt(disassemblyStart);
+                if (created == null) {
+                    result.set("Failed to disassemble at " + disassemblyStart +
+                        ": the transaction completed but no instruction persisted");
+                    return;
+                }
+                result.set("Disassembled " + cmd.getDisassembledAddressSet().getNumAddresses() +
+                    " byte(s) from " + disassemblyStart + " in " + mode +
+                    " mode; first instruction: " + created);
+            });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Disassembly interrupted while waiting for the transaction to commit";
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            return "Error verifying disassembly: " +
+                (cause != null && cause.getMessage() != null ? cause.getMessage() : e.getMessage());
+        }
         return result.get();
+    }
+
+    private boolean waitForToolCommands(long timeoutMillis) throws InterruptedException {
+        long deadline = System.nanoTime() + timeoutMillis * 1_000_000L;
+        while (tool.isExecutingCommand()) {
+            if (System.nanoTime() >= deadline) return false;
+            Thread.sleep(10);
+        }
+        return true;
     }
 
     /**
@@ -2329,14 +2359,15 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
-     * Creates a function at an already-disassembled instruction.
+     * Creates a function at an instruction, optionally disassembling its entry point first.
      *
      * A label is only a symbol, so converting LAB_* into something the
      * decompiler can consume requires a real Function object.  CreateFunctionCmd
      * computes the function body using the same logic as Ghidra's Create
      * Function action.
      */
-    private String createFunction(String programName, String addressStr, String name) {
+    private String createFunction(String programName, String addressStr, String name,
+            boolean disassembleIfNeeded) {
         Program program = getProgramByName(programName);
         if (program == null) return "No program loaded";
         if (addressStr == null || addressStr.isEmpty()) return "Address is required";
@@ -2351,12 +2382,33 @@ public class GhidraMCPPlugin extends Plugin {
         if (!program.getMemory().contains(addr)) return "Address is not in program memory: " + addr;
 
         String requestedName = (name == null || name.trim().isEmpty()) ? null : name.trim();
+
+        FunctionManager initialFunctionManager = program.getFunctionManager();
+        Function initialExisting = initialFunctionManager.getFunctionAt(addr);
+        if (initialExisting != null) {
+            return "Function already exists: " + initialExisting.getName() +
+                " at " + initialExisting.getEntryPoint();
+        }
+        Function initialContaining = initialFunctionManager.getFunctionContaining(addr);
+        if (initialContaining != null) {
+            return "Cannot create function at " + addr +
+                ": address is inside function " + initialContaining.getName() +
+                " at " + initialContaining.getEntryPoint();
+        }
+
+        if (program.getListing().getInstructionAt(addr) == null && disassembleIfNeeded) {
+            String disassemblyResult = disassembleCode(programName, addressStr, "auto");
+            if (!disassemblyResult.startsWith("Disassembled ")) {
+                return "Cannot create function at " + addr +
+                    ": automatic disassembly failed: " + disassemblyResult;
+            }
+        }
+
         AtomicReference<String> result = new AtomicReference<>("Failed to create function");
+        AtomicReference<CreateFunctionCmd> completedCommand = new AtomicReference<>();
 
         try {
             SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Create function via HTTP");
-                boolean success = false;
                 try {
                     FunctionManager functionManager = program.getFunctionManager();
                     Function existing = functionManager.getFunctionAt(addr);
@@ -2384,29 +2436,16 @@ public class GhidraMCPPlugin extends Plugin {
                         ? new CreateFunctionCmd(addr)
                         : new CreateFunctionCmd(requestedName, addr, null, SourceType.USER_DEFINED);
 
-                    if (!cmd.applyTo(program, new ConsoleTaskMonitor())) {
+                    if (!tool.execute(cmd, program)) {
                         String status = cmd.getStatusMsg();
                         result.set("Failed to create function at " + addr +
                             (status == null || status.isEmpty() ? "" : ": " + status));
                         return;
                     }
-
-                    Function created = functionManager.getFunctionAt(addr);
-                    if (created == null) {
-                        result.set("Failed to create function at " + addr +
-                            ": Ghidra reported success but no function was created");
-                        return;
-                    }
-
-                    success = true;
-                    result.set("Function created: " + created.getName() + " at " +
-                        created.getEntryPoint() + " (body " + created.getBody().getMinAddress() +
-                        " - " + created.getBody().getMaxAddress() + ")");
+                    completedCommand.set(cmd);
                 } catch (Exception e) {
                     Msg.error(this, "Error creating function", e);
                     result.set("Error creating function: " + e.getMessage());
-                } finally {
-                    program.endTransaction(tx, success);
                 }
             });
         } catch (InterruptedException e) {
@@ -2417,6 +2456,33 @@ public class GhidraMCPPlugin extends Plugin {
             Msg.error(this, "Failed to execute create function on Swing thread", e);
             Throwable cause = e.getCause();
             return "Error creating function: " +
+                (cause != null && cause.getMessage() != null ? cause.getMessage() : e.getMessage());
+        }
+
+        if (completedCommand.get() == null) return result.get();
+
+        try {
+            if (!waitForToolCommands(10_000)) {
+                return "Failed to create function at " + addr +
+                    ": Ghidra did not finish the function transaction within 10 seconds";
+            }
+            SwingUtilities.invokeAndWait(() -> {
+                Function created = program.getFunctionManager().getFunctionAt(addr);
+                if (created == null) {
+                    result.set("Failed to create function at " + addr +
+                        ": the transaction completed but no function persisted");
+                    return;
+                }
+                result.set("Function created: " + created.getName() + " at " +
+                    created.getEntryPoint() + " (body " + created.getBody().getMinAddress() +
+                    " - " + created.getBody().getMaxAddress() + ")");
+            });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Function creation interrupted while waiting for the transaction to commit";
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            return "Error verifying function creation: " +
                 (cause != null && cause.getMessage() != null ? cause.getMessage() : e.getMessage());
         }
 
