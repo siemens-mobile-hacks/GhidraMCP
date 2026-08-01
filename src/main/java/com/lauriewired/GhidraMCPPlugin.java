@@ -1136,7 +1136,7 @@ public class GhidraMCPPlugin extends Plugin {
                     }
 
                     CodeUnit codeUnit = listing.getCodeUnitContaining(disassemblyStart);
-                    if (codeUnit instanceof Data) {
+                    if (isDefinedData(codeUnit)) {
                         result.set("Cannot disassemble at " + disassemblyStart +
                             ": defined data overlaps the address; clear it first");
                         return;
@@ -1178,6 +1178,15 @@ public class GhidraMCPPlugin extends Plugin {
                 (cause != null && cause.getMessage() != null ? cause.getMessage() : e.getMessage());
         }
         return result.get();
+    }
+
+    /**
+     * Undefined bytes are exposed by Ghidra as {@link Data} code units too.  Only
+     * explicitly defined data should prevent the disassembler from replacing a
+     * code unit.
+     */
+    static boolean isDefinedData(CodeUnit codeUnit) {
+        return codeUnit instanceof Data && ((Data) codeUnit).isDefined();
     }
 
     /**

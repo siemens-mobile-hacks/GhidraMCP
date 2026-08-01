@@ -39,8 +39,10 @@ this fork adds:
   This matches Ghidra's distinction between symbols and `Function` objects,
   which are the objects accepted by the decompiler.
 - ARM/Thumb-aware `disassemble_code` with `auto`, `arm`, and `thumb` modes.
-  Existing instructions are preserved, and defined data must be cleared
-  explicitly before it can be converted to code.
+  Existing instructions are preserved, and explicitly defined data must be
+  cleared before it can be converted to code. Ghidra's one-byte `undefined`
+  data units, including those created for raw firmware imports, are treated as
+  disassemblable bytes and do not trigger the defined-data overlap guard.
 - Data-type tools backed by Ghidra's native `DataTypeParser` and `CParser`:
   inspect, create, and apply structures (including self-references and explicit
   field offsets), unions, enums, typedefs, pointers, arrays, bit fields, and C
