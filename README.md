@@ -47,6 +47,12 @@ this fork adds:
   disassemblable bytes and do not trigger the defined-data overlap guard. A
   successful response is returned only after the transaction completes and the
   instruction is confirmed in the listing.
+- Bit-accurate instruction pattern generation and search through
+  `create_instruction_pattern` and `search_instruction_pattern`. Patterns can
+  mask all operands, scalar/address operand classes, or selected operands by
+  zero-based instruction/operand index. They preserve partial-byte masks
+  emitted by Ghidra's Sleigh engine and search undefined as well as
+  disassembled bytes in loaded memory.
 - Data-type tools backed by Ghidra's native `DataTypeParser` and `CParser`:
   inspect, create, and apply structures (including self-references and explicit
   field offsets), unions, enums, typedefs, pointers, arrays, bit fields, and C
@@ -76,6 +82,32 @@ marked `(current)`), then pass a name or project path, e.g.
 behavior and uses the currently focused program, so existing usage is
 unaffected. GUI-context tools such as `get_current_address` intentionally report
 the focused Code Browser state and do not take a program selector.
+
+## Instruction pattern search
+
+`create_instruction_pattern` builds a pattern from one or more contiguous,
+already-disassembled instructions. By default the pattern is exact. Masking can
+be enabled for every operand (`mask_operands`), for all scalar or address
+operands (`mask_scalars` / `mask_addresses`), or for individual operands with
+`masked_operands`. Individual selectors use zero-based
+`instruction_index:operand_index` notation; for example, `0:1` selects the
+second operand of the first instruction.
+
+```python
+pattern = create_instruction_pattern(
+    address="00123456",
+    instruction_count=3,
+    masked_operands=["0:1", "2:0"],
+)
+matches = search_instruction_pattern(pattern=pattern, limit=100)
+```
+
+The canonical pattern format uses exact hexadecimal bytes (`D8`), full-byte
+wildcards (`??`), nibble wildcards (`A?` or `?5`), and Ghidra-compatible
+bit-level masks (`[10..01..]`). `search_instruction_pattern` accepts all these
+forms and optionally restricts matches with `start_address` and `end_address`.
+It searches loaded, initialized memory directly, so matching bytes do not need
+to have been disassembled first.
 
 # Installation
 

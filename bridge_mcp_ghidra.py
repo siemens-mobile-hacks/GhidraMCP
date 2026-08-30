@@ -253,6 +253,52 @@ def disassemble_code(address: str, mode: str = "auto", program: str = "") -> str
     }, program))
 
 @mcp.tool()
+def create_instruction_pattern(address: str, instruction_count: int = 1,
+                               mask_operands: bool = False,
+                               mask_scalars: bool = False,
+                               mask_addresses: bool = False,
+                               masked_operands: list[str] | None = None,
+                               program: str = "") -> str:
+    """
+    Create a bit-accurate pattern from contiguous instructions at address.
+
+    Exact bytes use hex ("D8"), full wildcards use "??", and partially
+    masked bytes use Ghidra-style bit expressions such as "[1001....]".
+    mask_operands masks every operand and takes precedence over the more
+    selective mask_scalars and mask_addresses options. masked_operands selects
+    individual operands as "instruction_index:operand_index" (zero-based),
+    for example ["0:1", "2:0"].
+    """
+    return safe_post("create_instruction_pattern", _with_program({
+        "address": address,
+        "instruction_count": instruction_count,
+        "mask_operands": str(mask_operands).lower(),
+        "mask_scalars": str(mask_scalars).lower(),
+        "mask_addresses": str(mask_addresses).lower(),
+        "masked_operands": ",".join(masked_operands or []),
+    }, program))
+
+@mcp.tool()
+def search_instruction_pattern(pattern: str, start_address: str = "",
+                               end_address: str = "", limit: int = 100,
+                               program: str = "") -> list:
+    """
+    Search loaded, initialized memory for an instruction pattern.
+
+    Accepts patterns produced by create_instruction_pattern plus exact hex
+    bytes, "??", nibble wildcards such as "A?"/"?F", and bit expressions
+    such as "[10..01..]". Results are match start addresses; matches may be
+    in undefined bytes and may overlap.
+    """
+    result = safe_post("search_instruction_pattern", _with_program({
+        "pattern": pattern,
+        "start_address": start_address,
+        "end_address": end_address,
+        "limit": limit,
+    }, program))
+    return result.splitlines()
+
+@mcp.tool()
 def set_decompiler_comment(address: str, comment: str, program: str = "") -> str:
     """
     Set a comment for a given address in the function pseudocode.
