@@ -54,6 +54,22 @@ final class MemoryTools {
             .program()
             .handler(this::write);
 
+        mcp.tool("add_to_program",
+                "Load a file into an existing program as additional memory (File > Add To Program). "
+                    + "With the default \"Raw Binary\" loader the file bytes become a new initialized "
+                    + "block at address (file_offset/length select part of the file; overlay=true creates "
+                    + "an overlay block when the range is already used). Other loaders that support it "
+                    + "(e.g. \"Executable and Linking Format (ELF)\") add the file's segments instead.")
+            .string("file_path", "Absolute path of the file on disk")
+            .optString("address", "", "Load address (required for Raw Binary)")
+            .optString("block_name", "", "Name of the new block (default: file name)")
+            .optInteger("file_offset", 0, "First byte of the file to load")
+            .optInteger("length", 0, "Number of bytes to load (0 = to the end of the file)")
+            .optBoolean("overlay", false, "Create an overlay block")
+            .optString("loader", "Raw Binary", "Loader name")
+            .program()
+            .handler(this::addToProgram);
+
         mcp.tool("search_memory",
                 "Search initialized memory. kind: hex (exact bytes, \"DEADBEEF\" or \"de ad be ef\"), "
                     + "string (ASCII), utf16le, utf16be, or value (an integer of width 1/2/4/8 bytes in "
@@ -297,6 +313,108 @@ final class MemoryTools {
         if (lines.isEmpty()) return "No matches for " + toHex(pat);
         return "Matches for " + toHex(pat) + ":\n" + String.join("\n", lines)
             + (more ? "\n-- more matches beyond limit " + limit + " --" : "");
+    }
+
+    private String addToProgram(McpServer.Args a) throws Exception {
+        Program p = McpSupport.program(env, a.str("program"));
+        java.io.File file = new java.io.File(a.str("file_path"));
+        if (!file.isFile()) throw McpSupport.fail("File not found: " + file);
+        String loaderName = a.str("loader").isBlank() ? ghidra.app.util.opinion.BinaryLoader.BINARY_NAME
+            : a.str("loader").trim();
+        ghidra.app.util.opinion.Loader loader = McpSupport.loader(loaderName);
+        if (!loader.supportsLoadIntoProgram()) {
+            throw McpSupport.fail("Loader " + loaderName + " cannot add to an existing program");
+        }
+        boolean raw = loader instanceof ghidra.app.util.opinion.BinaryLoader;
+        long fileOffset = a.integer("file_offset");
+        long length = a.integer("length");
+        if (fileOffset < 0 || fileOffset >= file.length()) {
+            throw McpSupport.fail("file_offset must be within the file (size " + file.length() + ")");
+        }
+        if (length <= 0) length = file.length() - fileOffset;
+        if (fileOffset + length > file.length()) {
+            throw McpSupport.fail("file_offset + length exceeds the file size " + file.length());
+        }
+        Address base = a.str("address").isBlank() ? null : McpSupport.address(p, a.str("address"));
+        if (raw && base == null) throw McpSupport.fail("address is required for the Raw Binary loader");
+        boolean overlay = a.bool("overlay");
+        if (raw && !overlay) {
+            Address last = base.add(length - 1);
+            List<String> clash = new ArrayList<>();
+            for (MemoryBlock b : p.getMemory().getBlocks()) {
+                if (b.getStart().getAddressSpace().equals(base.getAddressSpace())
+                        && b.getStart().compareTo(last) <= 0 && b.getEnd().compareTo(base) >= 0) {
+                    clash.add(b.getName() + " (" + b.getStart() + "-" + b.getEnd() + ")");
+                }
+            }
+            if (!clash.isEmpty()) {
+                throw McpSupport.fail(base + "-" + last + " overlaps " + String.join(", ", clash)
+                    + "; choose another address or pass overlay=true");
+            }
+        }
+        String blockName = a.str("block_name").isBlank() ? file.getName() : a.str("block_name").trim();
+
+        java.util.Set<String> before = new java.util.HashSet<>();
+        for (MemoryBlock b : p.getMemory().getBlocks()) before.add(b.getName() + "@" + b.getStart());
+        ghidra.app.util.importer.MessageLog log = new ghidra.app.util.importer.MessageLog();
+        try (ghidra.app.util.bin.ByteProvider provider = new ghidra.app.util.bin.FileByteProvider(file, null,
+                java.nio.file.AccessMode.READ)) {
+            ghidra.app.util.opinion.LoadSpec spec = new ghidra.app.util.opinion.LoadSpec(loader, 0,
+                new ghidra.program.model.lang.LanguageCompilerSpecPair(p.getLanguageID(),
+                    p.getCompilerSpec().getCompilerSpecID()), false);
+            List<ghidra.app.util.Option> options = loader.getDefaultOptions(provider, spec, p, true, false);
+            for (ghidra.app.util.Option o : options) {
+                switch (o.getName()) {
+                    case ghidra.app.util.opinion.BinaryLoader.OPTION_NAME_BASE_ADDR:
+                        if (base != null) o.setValue(base);
+                        break;
+                    case ghidra.app.util.opinion.BinaryLoader.OPTION_NAME_BLOCK_NAME:
+                        o.setValue(blockName);
+                        break;
+                    case ghidra.app.util.opinion.BinaryLoader.OPTION_NAME_FILE_OFFSET:
+                        o.setValue(numberLike(o, fileOffset));
+                        break;
+                    case ghidra.app.util.opinion.BinaryLoader.OPTION_NAME_LEN:
+                        o.setValue(numberLike(o, length));
+                        break;
+                    case ghidra.app.util.opinion.BinaryLoader.OPTION_NAME_IS_OVERLAY:
+                        o.setValue(overlay);
+                        break;
+                    default:
+                        break;
+                }
+            }
+            String invalid = loader.validateOptions(provider, spec, options, p);
+            if (invalid != null) throw McpSupport.fail("Invalid options: " + invalid);
+            ghidra.app.util.opinion.Loader.ImporterSettings settings =
+                new ghidra.app.util.opinion.Loader.ImporterSettings(provider, file.getName(), env.project(), "/",
+                    false, spec, options, this, log, TaskMonitor.DUMMY);
+            McpSupport.write(p, "Add To Program", () -> {
+                loader.loadInto(p, settings);
+                return null;
+            });
+        }
+        StringBuilder sb = new StringBuilder("Added " + file.getName() + " to " + p.getDomainFile().getPathname()
+            + " using " + loaderName + "\nNew memory blocks:");
+        int added = 0;
+        for (MemoryBlock b : p.getMemory().getBlocks()) {
+            if (before.contains(b.getName() + "@" + b.getStart())) continue;
+            added++;
+            sb.append(String.format("%n  %s: %s - %s  size=0x%x%s", b.getName(), b.getStart(), b.getEnd(),
+                b.getSize(), b.isOverlay() ? " overlay" : ""));
+        }
+        if (added == 0) sb.append(" (none)");
+        String messages = log.toString().trim();
+        if (!messages.isEmpty()) sb.append("\nLoader messages:\n").append(messages);
+        return sb.toString();
+    }
+
+    /** Converts a number to the value class an option expects (Long, Integer or Ghidra's HexLong). */
+    private static Object numberLike(ghidra.app.util.Option o, long value) throws Exception {
+        Class<?> c = o.getValueClass();
+        if (c == null || c == Long.class || c == long.class) return value;
+        if (c == Integer.class || c == int.class) return (int) value;
+        return c.getConstructor(long.class).newInstance(value);
     }
 
     private String listing(McpServer.Args a) {

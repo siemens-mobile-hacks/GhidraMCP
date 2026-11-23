@@ -467,7 +467,7 @@ final class ProjectTools {
         String compiler = a.str("compiler");
         if (compiler != null && !compiler.isBlank()) b.compiler(compiler.trim());
         String loader = a.str("loader");
-        if (loader != null && !loader.isBlank()) b.loaders(loader.trim());
+        if (loader != null && !loader.isBlank()) b.loaders(McpSupport.loader(loader).getClass());
         String base = a.str("base_address");
         if (base != null && !base.isBlank()) {
             String v = base.trim();

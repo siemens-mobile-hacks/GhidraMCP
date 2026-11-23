@@ -111,7 +111,7 @@ window or opened by the server in the background (`open_program`).
 |---|---|
 | Server | `get_server_info`, `shutdown_ghidra` |
 | Project | `get_project`, `list_project_files`, `create_project_folder`, `rename_project_file`, `move_project_file`, `delete_project_file`, `list_recent_projects`, `open_project`, `close_project`, `create_project` |
-| Programs | `list_open_programs`, `get_current_program`, `get_program_info`, `open_program` (background or CodeBrowser, `new_window`), `close_program`, `save_program`, `import_file` |
+| Programs | `list_open_programs`, `get_current_program`, `get_program_info`, `open_program` (background or CodeBrowser, `new_window`), `close_program`, `save_program`, `import_file`, `add_to_program` (File > Add To Program: load a file as new memory blocks) |
 | Analysis | `analyze_program` (blocking with timeout or background), `get_analysis_status`, `cancel_analysis`, `list_analyzers`, `set_analyzer_options` |
 | Functions | `list_functions` (filters), `get_function`, `get_adjacent_function`, `create_function`, `delete_function`, `rename_function(_by_address)` (namespaces via `A::B::f`), `set_function_prototype`, `list_function_variables`, `update_variable`, `set_function_comment`, `batch_rename_functions` |
 | Decompiler | `decompile_function(_by_address)` (cached per program, timeout, line ranges, optional P-code), `disassemble_function` (paging, bytes), `disassemble_code` |

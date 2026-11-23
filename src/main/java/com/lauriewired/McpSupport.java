@@ -175,6 +175,26 @@ final class McpSupport {
     }
 
     // ------------------------------------------------------------------
+    // Loaders
+    // ------------------------------------------------------------------
+
+    /**
+     * Finds a loader by its display name ("Raw Binary") or class name ("BinaryLoader"),
+     * case-insensitively. Ghidra's own lookup only accepts the class name.
+     */
+    static ghidra.app.util.opinion.Loader loader(String name) {
+        String n = name == null ? "" : name.trim();
+        List<String> names = new ArrayList<>();
+        for (ghidra.app.util.opinion.Loader l : ghidra.util.classfinder.ClassSearcher.getInstances(
+                ghidra.app.util.opinion.Loader.class)) {
+            if (l.getName().equalsIgnoreCase(n) || l.getClass().getSimpleName().equalsIgnoreCase(n)) return l;
+            names.add(l.getName());
+        }
+        java.util.Collections.sort(names);
+        throw fail("Unknown loader: " + name + ". Available: " + String.join(", ", names));
+    }
+
+    // ------------------------------------------------------------------
     // Names
     // ------------------------------------------------------------------
 

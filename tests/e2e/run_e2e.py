@@ -244,6 +244,14 @@ def project(c):
     c.check("import_file", "import_file",
             {"file_path": THUMB_O, "folder": "/e2e", "name": "thumb_import"},
             expect=["Imported thumb.o as /e2e/thumb_import", "ARM", "Opened in the background"])
+    c.call("delete_project_file", path="/e2e/blob_raw", confirm=True)
+    c.check("import_file raw binary loader", "import_file",
+            {"file_path": THUMB_O, "folder": "/e2e", "name": "blob_raw", "loader": "Raw Binary",
+             "language": "ARM:LE:32:Cortex", "base_address": "0x8000000", "open": False},
+            expect=["Imported thumb.o as /e2e/blob_raw", "Format: Raw Binary", "ARM:LE:32:Cortex"])
+    c.check("import_file unknown loader", "import_file", {"file_path": THUMB_O, "loader": "Nope"},
+            error=True, expect=["Unknown loader", "Raw Binary"])
+    c.check("delete raw import", "delete_project_file", {"path": "/e2e/blob_raw", "confirm": True})
     c.check("import_file missing", "import_file", {"file_path": "/nonexistent.bin"}, error=True,
             expect=["File not found"])
     c.check("imported program is current", "get_current_program", expect=["thumb_import"])
@@ -861,6 +869,51 @@ def gui_projects(c):
     c.check("dirty change was discarded", "open_program", {"path": "/mcp_target"}, expect=["Opened"])
     c.check("comment gone", "get_comments", {"program": P, "address": "00401000"}, absent=["dirty"])
     c.check("close", "close_program", {"program": P}, expect=["Closed"])
+
+
+# ---------------------------------------------------------------------------
+# Add To Program
+# ---------------------------------------------------------------------------
+
+BLOB = os.path.join(ROOT, "e2e-work", "bin", "blob.bin")
+
+
+@group("addtoprogram")
+def addtoprogram(c):
+    with open(BLOB, "wb") as f:
+        f.write(bytes(range(64)))
+    t, _ = c.call("list_segments", program=P)
+    if "e2e_blob" in t:
+        print("  skip (blocks from an earlier run in this session)")
+        return
+    c.check("add raw file", "add_to_program",
+            {"program": P, "file_path": BLOB, "address": "0x00700000", "block_name": "e2e_blob"},
+            expect=["using Raw Binary", "e2e_blob: 00700000 - 0070003f  size=0x40"])
+    c.check("added bytes", "read_bytes", {"program": P, "address": "00700000", "length": 8},
+            expect=["0001020304050607"])
+    c.check("block listed", "list_segments", {"program": P},
+            regex=[r"^e2e_blob: 00700000 - 0070003f  size=0x40  "])
+    c.check("part of file", "add_to_program",
+            {"program": P, "file_path": BLOB, "address": "0x00700100", "block_name": "e2e_part",
+             "file_offset": 16, "length": 8}, expect=["e2e_part: 00700100 - 00700107  size=0x8"])
+    c.check("part bytes", "read_bytes", {"program": P, "address": "00700100", "length": 8},
+            expect=["1011121314151617"])
+    c.check("overlap refused", "add_to_program",
+            {"program": P, "file_path": BLOB, "address": "0x00700020", "block_name": "e2e_clash"},
+            error=True, expect=["overlaps e2e_blob", "overlay=true"])
+    c.check("overlay", "add_to_program",
+            {"program": P, "file_path": BLOB, "address": "0x00700000", "block_name": "e2e_ovl",
+             "overlay": True}, expect=["overlay"])
+    c.check("address required", "add_to_program", {"program": P, "file_path": BLOB}, error=True,
+            expect=["address is required"])
+    c.check("bad offset", "add_to_program",
+            {"program": P, "file_path": BLOB, "address": "0x00710000", "file_offset": 100}, error=True)
+    c.check("unknown loader", "add_to_program",
+            {"program": P, "file_path": BLOB, "address": "0x00710000", "loader": "Nope"}, error=True,
+            expect=["Unknown loader"])
+    c.check("missing file", "add_to_program",
+            {"program": P, "file_path": "/nonexistent.bin", "address": "0x00710000"}, error=True,
+            expect=["File not found"])
 
 
 # ---------------------------------------------------------------------------
