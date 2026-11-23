@@ -21,10 +21,18 @@
         <fileSet>
             <directory>src/main/resources</directory>
             <includes>
-                <include>extension.properties</include>
                 <include>Module.manifest</include>
             </includes>
             <outputDirectory>GhidraMCP</outputDirectory>
+        </fileSet>
+        <!-- extension.properties gets the Ghidra version it was built against -->
+        <fileSet>
+            <directory>src/main/resources</directory>
+            <includes>
+                <include>extension.properties</include>
+            </includes>
+            <outputDirectory>GhidraMCP</outputDirectory>
+            <filtered>true</filtered>
         </fileSet>
         
         <!-- 2) Copy your built plugin JAR into GhidraMCP/lib -->

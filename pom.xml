@@ -10,6 +10,11 @@
   <name>GhidraMCP</name>
   <url>http://maven.apache.org</url>
 
+  <properties>
+    <!-- Ghidra version stamped into extension.properties; build.sh passes the installed one -->
+    <ghidra.version>12.1.2</ghidra.version>
+  </properties>
+
   <dependencies>
     <!-- Ghidra JARs as system-scoped dependencies -->
     <dependency>
@@ -151,6 +156,7 @@
           <!-- Exclude the App class -->
           <excludes>
             <exclude>**/App.class</exclude>
+            <exclude>extension.properties</exclude>
           </excludes>
           <!-- Make sure output directory is target for consistency -->
           <outputDirectory>${project.build.directory}</outputDirectory>

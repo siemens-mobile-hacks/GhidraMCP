@@ -67,6 +67,6 @@ copy_jar "${GHIDRA_DIR}/Framework/Gui/lib/Gui.jar" Gui.jar
 copy_versioned_jar "${GHIDRA_DIR}/Framework/Generic/lib" 'gson-*.jar' gson.jar
 
 echo "Building GhidraMCP for Ghidra ${GHIDRA_VERSION} from ${GHIDRA_HOME}"
-mvn -f "${ROOT_DIR}/pom.xml" clean package "$@"
+mvn -f "${ROOT_DIR}/pom.xml" clean package -Dghidra.version="${GHIDRA_VERSION}" "$@"
 
 echo "Extension package: ${ROOT_DIR}/target/GhidraMCP-1.0-SNAPSHOT.zip"
