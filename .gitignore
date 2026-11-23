@@ -52,3 +52,10 @@ replay_pid*
 # Third party JAR files from Ghidra
 lib/*.jar
 
+
+# Local end-to-end test project and binaries
+/e2e-work/
+__pycache__/
+
+# Planning documents are kept local, not committed
+/docs/*PLAN*.md

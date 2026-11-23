@@ -8,15 +8,15 @@ import junit.framework.TestCase;
 public class DisassemblyGuardTest extends TestCase {
 
     public void testUndefinedDataDoesNotBlockDisassembly() {
-        assertFalse(GhidraMCPPlugin.isDefinedData(dataWithDefinedState(false)));
+        assertFalse(CoreTool.isDefinedData(dataWithDefinedState(false)));
     }
 
     public void testDefinedDataBlocksDisassembly() {
-        assertTrue(GhidraMCPPlugin.isDefinedData(dataWithDefinedState(true)));
+        assertTrue(CoreTool.isDefinedData(dataWithDefinedState(true)));
     }
 
     public void testMissingCodeUnitDoesNotBlockDisassembly() {
-        assertFalse(GhidraMCPPlugin.isDefinedData(null));
+        assertFalse(CoreTool.isDefinedData(null));
     }
 
     private Data dataWithDefinedState(boolean defined) {

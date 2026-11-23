@@ -8,13 +8,13 @@ public class InstructionPatternTest extends TestCase {
 
     public void testFormatsExactWildcardNibbleAndBitTokens() {
         assertEquals("D8 ?? A? ?5 [10..01..]",
-            GhidraMCPPlugin.formatInstructionPattern(
+            InstructionPatternTools.formatInstructionPattern(
                 "11011000........1010........010110..01.."));
     }
 
     public void testParsesSupportedPatternForms() {
-        GhidraMCPPlugin.ParsedInstructionPattern pattern =
-            GhidraMCPPlugin.parseInstructionPattern("D8A0 ?? A? ?5 [10..01..]");
+        InstructionPatternTools.ParsedInstructionPattern pattern =
+            InstructionPatternTools.parseInstructionPattern("D8A0 ?? A? ?5 [10..01..]");
 
         assertBytesEqual(new int[] { 0xd8, 0xa0, 0x00, 0xa0, 0x05, 0x84 }, pattern.value);
         assertBytesEqual(new int[] { 0xff, 0xff, 0x00, 0xf0, 0x0f, 0xcc }, pattern.mask);
@@ -22,9 +22,9 @@ public class InstructionPatternTest extends TestCase {
 
     public void testGeneratedPatternRoundTripsWithoutLosingBits() {
         String binary = "11011000........1010........010110..01..";
-        String formatted = GhidraMCPPlugin.formatInstructionPattern(binary);
-        GhidraMCPPlugin.ParsedInstructionPattern parsed =
-            GhidraMCPPlugin.parseInstructionPattern(formatted);
+        String formatted = InstructionPatternTools.formatInstructionPattern(binary);
+        InstructionPatternTools.ParsedInstructionPattern parsed =
+            InstructionPatternTools.parseInstructionPattern(formatted);
 
         assertEquals(binary, toBinaryPattern(parsed));
     }
@@ -36,7 +36,7 @@ public class InstructionPatternTest extends TestCase {
     }
 
     public void testParsesAndDeduplicatesSelectiveOperandMasks() {
-        List<int[]> selectors = GhidraMCPPlugin.parseOperandSelectors("0:1, 2:0,0:1");
+        List<int[]> selectors = InstructionPatternTools.parseOperandSelectors("0:1, 2:0,0:1");
         assertEquals(2, selectors.size());
         assertEquals(0, selectors.get(0)[0]);
         assertEquals(1, selectors.get(0)[1]);
@@ -46,7 +46,7 @@ public class InstructionPatternTest extends TestCase {
 
     public void testRejectsMalformedOperandMaskSelector() {
         try {
-            GhidraMCPPlugin.parseOperandSelectors("0,1");
+            InstructionPatternTools.parseOperandSelectors("0,1");
             fail("Expected invalid operand selector");
         } catch (IllegalArgumentException expected) {
             // Expected.
@@ -55,7 +55,7 @@ public class InstructionPatternTest extends TestCase {
 
     private void assertInvalid(String pattern) {
         try {
-            GhidraMCPPlugin.parseInstructionPattern(pattern);
+            InstructionPatternTools.parseInstructionPattern(pattern);
             fail("Expected invalid pattern: " + pattern);
         } catch (IllegalArgumentException expected) {
             // Expected.
@@ -69,7 +69,7 @@ public class InstructionPatternTest extends TestCase {
         }
     }
 
-    private String toBinaryPattern(GhidraMCPPlugin.ParsedInstructionPattern pattern) {
+    private String toBinaryPattern(InstructionPatternTools.ParsedInstructionPattern pattern) {
         StringBuilder result = new StringBuilder();
         for (int i = 0; i < pattern.value.length; i++) {
             for (int bit = 7; bit >= 0; bit--) {

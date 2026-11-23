@@ -36,5 +36,13 @@
             </includes>
             <outputDirectory>GhidraMCP/lib</outputDirectory>
         </fileSet>
+        <!-- 3) Headless entry script -->
+        <fileSet>
+            <directory>ghidra_scripts</directory>
+            <includes>
+                <include>*.java</include>
+            </includes>
+            <outputDirectory>GhidraMCP/ghidra_scripts</outputDirectory>
+        </fileSet>
     </fileSets>
 </assembly>
