@@ -30,6 +30,7 @@ final class ScriptTools {
     private static final Pattern CLASS_DECL =
         Pattern.compile("public\\s+class\\s+(\\w+)\\s+extends\\s+GhidraScript");
     private static final int MAX_OUTPUT = 200_000;
+    private static final String SCRIPT_MANAGER = "ghidra.app.plugin.core.script.GhidraScriptMgrPlugin";
 
     private final McpEnvironment env;
 
@@ -123,7 +124,7 @@ final class ScriptTools {
                 File dir = new File(ghidra.framework.Application.getUserSettingsDirectory(), "ghidramcp_scripts");
                 if (!dir.isDirectory() && !dir.mkdirs()) throw McpSupport.fail("Cannot create " + dir);
                 tempBundle = new ResourceFile(dir);
-                ghidra.app.plugin.core.osgi.GhidraBundle existing = host.getExistingGhidraBundle(tempBundle);
+                ghidra.app.plugin.core.osgi.GhidraBundle existing = host.getGhidraBundle(tempBundle);
                 if (existing != null && !(existing instanceof ghidra.app.plugin.core.osgi.GhidraSourceBundle)) {
                     host.remove(existing);
                     existing = null;
@@ -225,9 +226,21 @@ final class ScriptTools {
      * Adds the script directories configured in the Script Manager (stored in the saved tool
      * configurations, e.g. tools/_code_browser.tcd) that the bundle host does not know yet. The
      * Script Manager restores them only while a CodeBrowser is open; without one (project window
-     * only, or headless) the host has just the built-in directories.
+     * only, or headless) the host has just the built-in directories. While a Script Manager is
+     * running it owns the directory list, so nothing is changed then.
      */
-    private static void addConfiguredScriptDirs(ghidra.app.plugin.core.osgi.BundleHost host) {
+    private void addConfiguredScriptDirs(ghidra.app.plugin.core.osgi.BundleHost host) {
+        for (PluginTool tool : env.runningTools()) {
+            for (ghidra.framework.plugintool.Plugin plugin : tool.getManagedPlugins()) {
+                if (plugin.getClass().getName().equals(SCRIPT_MANAGER)) return; // Ghidra manages them
+            }
+        }
+        synchronized (ScriptTools.class) { // concurrent calls must not add a directory twice
+            addConfiguredScriptDirsLocked(host);
+        }
+    }
+
+    private static void addConfiguredScriptDirsLocked(ghidra.app.plugin.core.osgi.BundleHost host) {
         File[] configs = new File(ghidra.framework.Application.getUserSettingsDirectory(), "tools")
             .listFiles((d, n) -> n.endsWith(".tcd"));
         if (configs == null) return;
@@ -238,14 +251,14 @@ final class ScriptTools {
                 org.w3c.dom.NodeList plugins = f.newDocumentBuilder().parse(config).getElementsByTagName("PLUGIN_STATE");
                 for (int p = 0; p < plugins.getLength(); p++) {
                     org.w3c.dom.Element plugin = (org.w3c.dom.Element) plugins.item(p);
-                    if (!"ghidra.app.plugin.core.script.GhidraScriptMgrPlugin".equals(plugin.getAttribute("CLASS"))) {
+                    if (!SCRIPT_MANAGER.equals(plugin.getAttribute("CLASS"))) {
                         continue;
                     }
                     List<String> files = arrayValues(plugin, "BundleHost_FILE");
                     List<String> enabled = arrayValues(plugin, "BundleHost_ENABLE");
                     for (int i = 0; i < files.size(); i++) {
                         ResourceFile dir = generic.util.Path.fromPathString(files.get(i));
-                        if (!dir.isDirectory() || host.getExistingGhidraBundle(dir) != null) continue;
+                        if (!dir.isDirectory() || host.getGhidraBundle(dir) != null) continue;
                         host.add(dir, i >= enabled.size() || Boolean.parseBoolean(enabled.get(i)), false);
                     }
                 }
