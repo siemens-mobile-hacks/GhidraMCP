@@ -244,17 +244,22 @@ def project(c):
     c.check("import_file", "import_file",
             {"file_path": THUMB_O, "folder": "/e2e", "name": "thumb_import"},
             expect=["Imported thumb.o as /e2e/thumb_import", "ARM", "Opened in the background"])
+    c.check("imported program is current", "get_current_program", expect=["thumb_import"])
     c.call("delete_project_file", path="/e2e/blob_raw", confirm=True)
     c.check("import_file raw binary loader", "import_file",
             {"file_path": THUMB_O, "folder": "/e2e", "name": "blob_raw", "loader": "Raw Binary",
-             "language": "ARM:LE:32:Cortex", "base_address": "0x8000000", "open": False},
+             "language": "ARM:LE:32:Cortex", "base_address": "0x8000000", "block_name": "flash",
+             "file_offset": 16, "length": 64, "open": False},
             expect=["Imported thumb.o as /e2e/blob_raw", "Format: Raw Binary", "ARM:LE:32:Cortex"])
+    c.call("open_program", path="/e2e/blob_raw")
+    c.check("raw import block name/offset/length", "list_segments", {"program": "/e2e/blob_raw"},
+            regex=[r"^flash: 0?8000000 - 0?800003f  size=0x40 "])
+    c.call("close_program", program="/e2e/blob_raw")
     c.check("import_file unknown loader", "import_file", {"file_path": THUMB_O, "loader": "Nope"},
             error=True, expect=["Unknown loader", "Raw Binary"])
     c.check("delete raw import", "delete_project_file", {"path": "/e2e/blob_raw", "confirm": True})
     c.check("import_file missing", "import_file", {"file_path": "/nonexistent.bin"}, error=True,
             expect=["File not found"])
-    c.check("imported program is current", "get_current_program", expect=["thumb_import"])
     c.check("imported program not analyzed", "get_program_info", {"program": "/e2e/thumb_import"},
             expect=["Analysis: not analyzed"])
     c.check("open_program mode=tool headless", "open_program",

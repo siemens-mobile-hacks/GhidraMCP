@@ -100,6 +100,9 @@ final class ProjectTools {
             .optString("compiler", "", "Compiler spec ID, e.g. default (default: auto)")
             .optString("loader", "", "Loader name, e.g. \"Raw Binary\" or \"Executable and Linking Format (ELF)\"")
             .optString("base_address", "", "Image base / load address (loader option), e.g. 0x8000000")
+            .optString("block_name", "", "Raw Binary: name of the memory block (Ghidra default: ram)")
+            .optInteger("file_offset", 0, "Raw Binary: first byte of the file to load")
+            .optInteger("length", 0, "Raw Binary: number of bytes to load (0 = to the end of the file)")
             .optBoolean("open", true, "Open the imported program in the background")
             .handler(a -> importFile(a));
 
@@ -473,6 +476,10 @@ final class ProjectTools {
             String v = base.trim();
             b.addLoaderArg("-loader-baseAddr", v.startsWith("0x") || v.startsWith("0X") ? v.substring(2) : v);
         }
+        String blockName = a.str("block_name");
+        if (blockName != null && !blockName.isBlank()) b.addLoaderArg("-loader-blockName", blockName.trim());
+        if (a.integer("file_offset") > 0) b.addLoaderArg("-loader-fileOffset", Integer.toHexString(a.integer("file_offset")));
+        if (a.integer("length") > 0) b.addLoaderArg("-loader-length", Integer.toHexString(a.integer("length")));
         MessageLog log = new MessageLog();
         b.log(log);
         Object consumer = this;
