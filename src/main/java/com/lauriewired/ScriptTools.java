@@ -62,7 +62,7 @@ final class ScriptTools {
 
     private String list(String filter, int offset, int limit) {
         String f = filter == null ? "" : filter.toLowerCase(Locale.ROOT);
-        GhidraScriptUtil.acquireBundleHostReference();
+        addConfiguredScriptDirs(GhidraScriptUtil.acquireBundleHostReference());
         try {
             List<String> lines = new ArrayList<>();
             for (ResourceFile dir : GhidraScriptUtil.getEnabledScriptSourceDirectories()) {
@@ -104,6 +104,7 @@ final class ScriptTools {
         String[] args = toArgs(a.array("args"));
 
         ghidra.app.plugin.core.osgi.BundleHost host = GhidraScriptUtil.acquireBundleHostReference();
+        addConfiguredScriptDirs(host);
         File temp = null;
         ResourceFile tempBundle = null;
         try {
@@ -218,5 +219,54 @@ final class ScriptTools {
         int i = 0;
         for (JsonElement e : arr) out[i++] = e.getAsString();
         return out;
+    }
+
+    /**
+     * Adds the script directories configured in the Script Manager (stored in the saved tool
+     * configurations, e.g. tools/_code_browser.tcd) that the bundle host does not know yet. The
+     * Script Manager restores them only while a CodeBrowser is open; without one (project window
+     * only, or headless) the host has just the built-in directories.
+     */
+    private static void addConfiguredScriptDirs(ghidra.app.plugin.core.osgi.BundleHost host) {
+        File[] configs = new File(ghidra.framework.Application.getUserSettingsDirectory(), "tools")
+            .listFiles((d, n) -> n.endsWith(".tcd"));
+        if (configs == null) return;
+        for (File config : configs) {
+            try {
+                javax.xml.parsers.DocumentBuilderFactory f = javax.xml.parsers.DocumentBuilderFactory.newInstance();
+                f.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+                org.w3c.dom.NodeList plugins = f.newDocumentBuilder().parse(config).getElementsByTagName("PLUGIN_STATE");
+                for (int p = 0; p < plugins.getLength(); p++) {
+                    org.w3c.dom.Element plugin = (org.w3c.dom.Element) plugins.item(p);
+                    if (!"ghidra.app.plugin.core.script.GhidraScriptMgrPlugin".equals(plugin.getAttribute("CLASS"))) {
+                        continue;
+                    }
+                    List<String> files = arrayValues(plugin, "BundleHost_FILE");
+                    List<String> enabled = arrayValues(plugin, "BundleHost_ENABLE");
+                    for (int i = 0; i < files.size(); i++) {
+                        ResourceFile dir = generic.util.Path.fromPathString(files.get(i));
+                        if (!dir.isDirectory() || host.getExistingGhidraBundle(dir) != null) continue;
+                        host.add(dir, i >= enabled.size() || Boolean.parseBoolean(enabled.get(i)), false);
+                    }
+                }
+            }
+            catch (Exception ex) {
+                ghidra.util.Msg.debug(ScriptTools.class, "Cannot read script directories from " + config, ex);
+            }
+        }
+    }
+
+    private static List<String> arrayValues(org.w3c.dom.Element parent, String name) {
+        List<String> values = new ArrayList<>();
+        org.w3c.dom.NodeList arrays = parent.getElementsByTagName("ARRAY");
+        for (int i = 0; i < arrays.getLength(); i++) {
+            org.w3c.dom.Element array = (org.w3c.dom.Element) arrays.item(i);
+            if (!name.equals(array.getAttribute("NAME"))) continue;
+            org.w3c.dom.NodeList items = array.getElementsByTagName("A");
+            for (int j = 0; j < items.getLength(); j++) {
+                values.add(((org.w3c.dom.Element) items.item(j)).getAttribute("VALUE"));
+            }
+        }
+        return values;
     }
 }
